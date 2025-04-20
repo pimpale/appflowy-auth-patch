@@ -43,6 +43,8 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	db := a.db.WithContext(ctx)
 	config := a.config
 
+	fmt.Println("MagicLink")
+
 	if !config.External.Email.Enabled {
 		return unprocessableEntityError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
 	}
@@ -51,10 +53,12 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	jsonDecoder := json.NewDecoder(r.Body)
 	err := jsonDecoder.Decode(params)
 	if err != nil {
+		fmt.Println("MagicLink error (could not read verification params)", err)
 		return badRequestError(ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
 	}
 
 	if err := params.Validate(); err != nil {
+		fmt.Println("MagicLink error (could not validate params)", err)
 		return err
 	}
 
@@ -69,12 +73,15 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	user, err := models.FindUserByEmailAndAudience(db, params.Email, aud)
 	if err != nil {
 		if models.IsNotFoundError(err) {
+			fmt.Println("MagicLink user not found")
 			isNewUser = true
 		} else {
+			fmt.Println("MagicLink error (database error finding user)", err)
 			return internalServerError("Database error finding user").WithInternalError(err)
 		}
 	}
 	if user != nil {
+		fmt.Println("MagicLink user found")
 		isNewUser = !user.IsConfirmed()
 	}
 	if isNewUser {
@@ -82,6 +89,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 		// Sign them up with temporary password.
 		password, err := password.Generate(64, 10, 1, false, true)
 		if err != nil {
+			fmt.Println("MagicLink error (error creating user)", err)
 			return internalServerError("error creating user").WithInternalError(err)
 		}
 
@@ -102,6 +110,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 
 		fakeResponse := &responseStub{}
 		if config.Mailer.Autoconfirm {
+			fmt.Println("MagicLink autoconfirm")
 			// signups are autoconfirmed, send magic link after signup
 			if err := a.Signup(fakeResponse, r); err != nil {
 				return err
@@ -122,6 +131,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 		}
 		// otherwise confirmation email already contains 'magic link'
 		if err := a.Signup(fakeResponse, r); err != nil {
+			fmt.Println("MagicLink error (error signing up)", err)
 			return err
 		}
 
@@ -130,20 +140,24 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 
 	if isPKCEFlow(flowType) {
 		if _, err = generateFlowState(a.db, models.MagicLink.String(), models.MagicLink, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); err != nil {
+			fmt.Println("MagicLink error (error generating flow state)", err)
 			return err
 		}
 	}
 
 	err = db.Transaction(func(tx *storage.Connection) error {
 		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
+			fmt.Println("MagicLink error (error creating audit log entry)", terr)
 			return terr
 		}
 		return a.sendMagicLink(r, tx, user, flowType)
 	})
 	if err != nil {
 		if errors.Is(err, MaxFrequencyLimitError) {
+			fmt.Println("MagicLink error (max frequency limit)", err)
 			return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, generateFrequencyLimitErrorMessage(user.RecoverySentAt, config.SMTP.MaxFrequency))
 		}
+		fmt.Println("MagicLink error (error sending magic link)", err)
 		return internalServerError("Error sending magic link").WithInternalError(err)
 	}
 
