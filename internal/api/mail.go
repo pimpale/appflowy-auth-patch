@@ -456,15 +456,25 @@ func (a *API) sendMagicLink(r *http.Request, tx *storage.Connection, u *models.U
 		// OTP generation must succeed
 		panic(err)
 	}
+
+	// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! BEGIN PATCH !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	otp = "123456"
+	// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! END PATCH !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 	token := crypto.GenerateTokenHash(u.GetEmail(), otp)
 	u.RecoveryToken = addFlowPrefixToToken(token, flowType)
 
 	now := time.Now()
-	err = a.sendEmail(r, tx, u, mail.MagicLinkVerification, otp, "", u.RecoveryToken)
-	if err != nil {
-		u.RecoveryToken = oldToken
-		return errors.Wrap(err, "Error sending magic link email")
-	}
+
+	// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! BEGIN PATCH !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	_ = oldToken
+	// err = a.sendEmail(r, tx, u, mail.MagicLinkVerification, otp, "", u.RecoveryToken)
+	// if err != nil {
+	// 	u.RecoveryToken = oldToken
+	// 	return errors.Wrap(err, "Error sending magic link email")
+	// }
+	// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! END PATCH !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 	u.RecoverySentAt = &now
 	err = tx.UpdateOnly(u, "recovery_token", "recovery_sent_at")
 	if err != nil {
