@@ -13,12 +13,6 @@ import (
 	"github.com/supabase/auth/internal/storage"
 )
 
-// UserChangePasswordParams parameters for updating a user's password
-type UserChangePasswordParams struct {
-	OldPassword string `json:"current_password"`
-	Password    string `json:"password"`
-}
-
 // UserUpdateParams parameters for updating a user
 type UserUpdateParams struct {
 	Email               string                 `json:"email"`
@@ -79,100 +73,6 @@ func (a *API) UserGet(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	user := getUser(ctx)
-	return sendJSON(w, http.StatusOK, user)
-}
-
-// UserAuthGet returns authentication information for a user
-func (a *API) UserAuthInfoGet(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-	claims := getClaims(ctx)
-	if claims == nil {
-		return apierrors.NewInternalServerError("Could not read claims")
-	}
-
-	aud := a.requestAud(ctx, r)
-	audienceFromClaims, _ := claims.GetAudience()
-	if len(audienceFromClaims) == 0 || aud != audienceFromClaims[0] {
-		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Token audience doesn't match request audience")
-	}
-
-	user := getUser(ctx)
-	userAuthInfo := models.UserAuthInfo{
-		HasPassword: user.HasPassword(),
-		IsSSOUser:   user.IsSSOUser,
-	}
-	return sendJSON(w, http.StatusOK, &userAuthInfo)
-}
-
-func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-	db := a.db.WithContext(ctx)
-	config := a.config
-
-	params := &UserChangePasswordParams{}
-
-	user := getUser(ctx)
-	session := getSession(ctx)
-
-	if err := retrieveRequestParams(r, params); err != nil {
-		return err
-	}
-	if user.IsAnonymous {
-		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
-	}
-	if user.IsSSOUser {
-		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an SSO user is not possible")
-	}
-
-	password := params.Password
-	current_password := params.OldPassword
-	if err := a.checkPasswordStrength(ctx, params.Password); err != nil {
-		return err
-	}
-
-	if user.HasPassword() {
-		isCurrentPasswordCorrect, _, err := user.Authenticate(ctx, db, current_password, config.Security.DBEncryption.DecryptionKeys, false, "")
-		if err != nil {
-			return err
-		}
-		if !isCurrentPasswordCorrect {
-			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeIncorrectCurrentPassword, "Incorrect current password")
-		}
-		isSamePassword, _, err := user.Authenticate(ctx, db, password, config.Security.DBEncryption.DecryptionKeys, false, "")
-		if err != nil {
-			return err
-		}
-		if isSamePassword {
-			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeSamePassword, "New password should be different from the old password.")
-		}
-	}
-
-	if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
-		return err
-	}
-
-	err := db.Transaction(func(tx *storage.Connection) error {
-		var terr error
-		var sessionID *uuid.UUID
-		if session != nil {
-			sessionID = &session.ID
-		}
-
-		if terr = user.UpdatePassword(tx, sessionID); terr != nil {
-			return apierrors.NewInternalServerError("Error during password storage").WithInternalError(terr)
-		}
-
-		if terr := models.NewAuditLogEntry(r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {
-			return terr
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
 	return sendJSON(w, http.StatusOK, user)
 }
 

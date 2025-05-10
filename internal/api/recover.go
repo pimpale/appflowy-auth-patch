@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 
-	"github.com/gofrs/uuid"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
@@ -34,7 +33,6 @@ func (p *RecoverParams) Validate(a *API) error {
 func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 	params := &RecoverParams{}
 	if err := retrieveRequestParams(r, params); err != nil {
 		return err
@@ -45,7 +43,6 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	session := getSession(ctx)
 	var user *models.User
 	var err error
 	aud := a.requestAud(ctx, r)
@@ -63,18 +60,7 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	if err := user.SetPassword(ctx, "", config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
-		return err
-	}
-
 	err = db.Transaction(func(tx *storage.Connection) error {
-		var sessionID *uuid.UUID
-		if session != nil {
-			sessionID = &session.ID
-		}
-		if terr := user.UpdatePassword(tx, sessionID); terr != nil {
-			return apierrors.NewInternalServerError("Error during resetting password").WithInternalError(terr)
-		}
 		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 			return terr
 		}
