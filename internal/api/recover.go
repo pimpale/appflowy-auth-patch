@@ -3,11 +3,8 @@ package api
 import (
 	"net/http"
 
-<<<<<<< HEAD
 	"github.com/gofrs/uuid"
-=======
 	"github.com/supabase/auth/internal/api/apierrors"
->>>>>>> upstream/master
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
 )
