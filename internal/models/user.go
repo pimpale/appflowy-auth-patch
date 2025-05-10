@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -81,6 +82,11 @@ type UserAuthInfo struct {
 func NewUserWithPasswordHash(phone, email, passwordHash, aud string, userData map[string]interface{}) (*User, error) {
 	if strings.HasPrefix(passwordHash, crypto.Argon2Prefix) {
 		_, err := crypto.ParseArgon2Hash(passwordHash)
+		if err != nil {
+			return nil, err
+		}
+	} else if strings.HasPrefix(passwordHash, crypto.FirebaseScryptPrefix) {
+		_, err := crypto.ParseFirebaseScryptHash(passwordHash)
 		if err != nil {
 			return nil, err
 		}
@@ -406,7 +412,7 @@ func (u *User) Authenticate(ctx context.Context, tx *storage.Connection, passwor
 
 	compareErr := crypto.CompareHashAndPassword(ctx, hash, password)
 
-	if !strings.HasPrefix(hash, crypto.Argon2Prefix) {
+	if !strings.HasPrefix(hash, crypto.Argon2Prefix) && !strings.HasPrefix(hash, crypto.FirebaseScryptPrefix) {
 		// check if cost exceeds default cost or is too low
 		cost, err := bcrypt.Cost([]byte(hash))
 		if err != nil {
@@ -449,6 +455,12 @@ func (u *User) Confirm(tx *storage.Connection) error {
 		return err
 	}
 
+	if err := u.UpdateUserMetaData(tx, map[string]interface{}{
+		"email_verified": true,
+	}); err != nil {
+		return err
+	}
+
 	if err := ClearAllOneTimeTokensForUser(tx, u.ID); err != nil {
 		return err
 	}
@@ -462,7 +474,7 @@ func (u *User) ConfirmPhone(tx *storage.Connection) error {
 	now := time.Now()
 	u.PhoneConfirmedAt = &now
 	if err := tx.UpdateOnly(u, "confirmation_token", "phone_confirmed_at"); err != nil {
-		return nil
+		return err
 	}
 
 	return ClearAllOneTimeTokensForUser(tx, u.ID)
@@ -578,6 +590,18 @@ func (u *User) Recover(tx *storage.Connection) error {
 	return ClearAllOneTimeTokensForUser(tx, u.ID)
 }
 
+// HighestPossibleAAL returns the AAL level that this user can obtain. Derived
+// from the number of verified MFA factors associated with the user object.
+func (u *User) HighestPossibleAAL() AuthenticatorAssuranceLevel {
+	for _, factor := range u.Factors {
+		if factor.Status == FactorStateVerified.String() {
+			return AAL2
+		}
+	}
+
+	return AAL1
+}
+
 // CountOtherUsers counts how many other users exist besides the one provided
 func CountOtherUsers(tx *storage.Connection, id uuid.UUID) (int, error) {
 	userCount, err := tx.Q().Where("instance_id = ? and id != ?", uuid.Nil, id).Count(&User{})
@@ -689,8 +713,8 @@ func FindUsersInAudience(tx *storage.Connection, aud string, pageParams *Paginat
 
 	var err error
 	if pageParams != nil {
-		err = q.Paginate(int(pageParams.Page), int(pageParams.PerPage)).All(&users)
-		pageParams.Count = uint64(q.Paginator.TotalEntriesSize)
+		err = q.Paginate(int(pageParams.Page), int(pageParams.PerPage)).All(&users) // #nosec G115
+		pageParams.Count = uint64(q.Paginator.TotalEntriesSize)                     // #nosec G115
 	} else {
 		err = q.All(&users)
 	}
@@ -776,6 +800,16 @@ func (u *User) IsBanned() bool {
 		return false
 	}
 	return time.Now().Before(*u.BannedUntil)
+}
+
+func (u *User) HasMFAEnabled() bool {
+	for _, factor := range u.Factors {
+		if factor.IsVerified() {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (u *User) UpdateBannedUntil(tx *storage.Connection) error {
@@ -922,6 +956,31 @@ func (u *User) FindOwnedFactorByID(tx *storage.Connection, factorID uuid.UUID) (
 		return nil, err
 	}
 	return &factor, nil
+}
+
+func (user *User) WebAuthnID() []byte {
+	return []byte(user.ID.String())
+}
+
+func (user *User) WebAuthnName() string {
+	return user.Email.String()
+}
+
+func (user *User) WebAuthnDisplayName() string {
+	return user.Email.String()
+}
+
+func (user *User) WebAuthnCredentials() []webauthn.Credential {
+	var credentials []webauthn.Credential
+
+	for _, factor := range user.Factors {
+		if factor.IsVerified() && factor.FactorType == WebAuthn {
+			credential := factor.WebAuthnCredential.Credential
+			credentials = append(credentials, credential)
+		}
+	}
+
+	return credentials
 }
 
 func obfuscateValue(id uuid.UUID, value string) string {

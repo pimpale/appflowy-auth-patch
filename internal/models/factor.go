@@ -2,10 +2,13 @@ package models
 
 import (
 	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -32,6 +35,7 @@ func (factorState FactorState) String() string {
 
 const TOTP = "totp"
 const Phone = "phone"
+const WebAuthn = "webauthn"
 
 type AuthenticationMethod int
 
@@ -41,6 +45,7 @@ const (
 	OTP
 	TOTPSignIn
 	MFAPhone
+	MFAWebAuthn
 	SSOSAML
 	Recovery
 	Invite
@@ -49,6 +54,7 @@ const (
 	EmailChange
 	TokenRefresh
 	Anonymous
+	Web3
 )
 
 func (authMethod AuthenticationMethod) String() string {
@@ -79,6 +85,10 @@ func (authMethod AuthenticationMethod) String() string {
 		return "anonymous"
 	case MFAPhone:
 		return "mfa/phone"
+	case MFAWebAuthn:
+		return "mfa/webauthn"
+	case Web3:
+		return "web3"
 	}
 	return ""
 }
@@ -112,6 +122,11 @@ func ParseAuthenticationMethod(authMethod string) (AuthenticationMethod, error) 
 		return TokenRefresh, nil
 	case "mfa/sms":
 		return MFAPhone, nil
+	case "mfa/webauthn":
+		return MFAWebAuthn, nil
+	case "web3":
+		return Web3, nil
+
 	}
 	return 0, fmt.Errorf("unsupported authentication method %q", authMethod)
 }
@@ -119,17 +134,52 @@ func ParseAuthenticationMethod(authMethod string) (AuthenticationMethod, error) 
 type Factor struct {
 	ID uuid.UUID `json:"id" db:"id"`
 	// TODO: Consider removing this nested user field. We don't use it.
-	User             User               `json:"-" belongs_to:"user"`
-	UserID           uuid.UUID          `json:"-" db:"user_id"`
-	CreatedAt        time.Time          `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time          `json:"updated_at" db:"updated_at"`
-	Status           string             `json:"status" db:"status"`
-	FriendlyName     string             `json:"friendly_name,omitempty" db:"friendly_name"`
-	Secret           string             `json:"-" db:"secret"`
-	FactorType       string             `json:"factor_type" db:"factor_type"`
-	Challenge        []Challenge        `json:"-" has_many:"challenges"`
-	Phone            storage.NullString `json:"phone" db:"phone"`
-	LastChallengedAt *time.Time         `json:"last_challenged_at" db:"last_challenged_at"`
+	User               User                `json:"-" belongs_to:"user"`
+	UserID             uuid.UUID           `json:"-" db:"user_id"`
+	CreatedAt          time.Time           `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at" db:"updated_at"`
+	Status             string              `json:"status" db:"status"`
+	FriendlyName       string              `json:"friendly_name,omitempty" db:"friendly_name"`
+	Secret             string              `json:"-" db:"secret"`
+	FactorType         string              `json:"factor_type" db:"factor_type"`
+	Challenge          []Challenge         `json:"-" has_many:"challenges"`
+	Phone              storage.NullString  `json:"phone" db:"phone"`
+	LastChallengedAt   *time.Time          `json:"last_challenged_at" db:"last_challenged_at"`
+	WebAuthnCredential *WebAuthnCredential `json:"-" db:"web_authn_credential"`
+	WebAuthnAAGUID     *uuid.UUID          `json:"web_authn_aaguid,omitempty" db:"web_authn_aaguid"`
+}
+
+type WebAuthnCredential struct {
+	webauthn.Credential
+}
+
+func (wc *WebAuthnCredential) Value() (driver.Value, error) {
+	if wc == nil {
+		return nil, nil
+	}
+	return json.Marshal(wc)
+}
+
+func (wc *WebAuthnCredential) Scan(value interface{}) error {
+	if value == nil {
+		wc.Credential = webauthn.Credential{}
+		return nil
+	}
+	// Handle byte and string as a precaution, in postgres driver, json/jsonb should be returned as []byte
+	var data []byte
+	switch v := value.(type) {
+	case []byte:
+		data = v
+	case string:
+		data = []byte(v)
+	default:
+		return fmt.Errorf("unsupported type for web_authn_credential: %T", value)
+	}
+	if len(data) == 0 {
+		wc.Credential = webauthn.Credential{}
+		return nil
+	}
+	return json.Unmarshal(data, &wc.Credential)
 }
 
 func (Factor) TableName() string {
@@ -160,6 +210,11 @@ func NewPhoneFactor(user *User, phone, friendlyName string) *Factor {
 	return factor
 }
 
+func NewWebAuthnFactor(user *User, friendlyName string) *Factor {
+	factor := NewFactor(user, friendlyName, WebAuthn, FactorStateUnverified)
+	return factor
+}
+
 func (f *Factor) SetSecret(secret string, encrypt bool, encryptionKeyID, encryptionKey string) error {
 	f.Secret = secret
 	if encrypt {
@@ -185,6 +240,24 @@ func (f *Factor) GetSecret(decryptionKeys map[string]string, encrypt bool, encry
 	}
 
 	return f.Secret, encrypt, nil
+}
+
+func (f *Factor) SaveWebAuthnCredential(tx *storage.Connection, credential *webauthn.Credential) error {
+	f.WebAuthnCredential = &WebAuthnCredential{
+		Credential: *credential,
+	}
+
+	if len(credential.Authenticator.AAGUID) > 0 {
+		aaguidUUID, err := uuid.FromBytes(credential.Authenticator.AAGUID)
+		if err != nil {
+			return fmt.Errorf("WebAuthn authenticator AAGUID is not UUID: %w", err)
+		}
+		f.WebAuthnAAGUID = &aaguidUUID
+	} else {
+		f.WebAuthnAAGUID = nil
+	}
+
+	return tx.UpdateOnly(f, "web_authn_credential", "web_authn_aaguid", "updated_at")
 }
 
 func FindFactorByFactorID(conn *storage.Connection, factorID uuid.UUID) (*Factor, error) {
@@ -245,16 +318,15 @@ func (f *Factor) UpdateFriendlyName(tx *storage.Connection, friendlyName string)
 	return tx.UpdateOnly(f, "friendly_name", "updated_at")
 }
 
+func (f *Factor) UpdatePhone(tx *storage.Connection, phone string) error {
+	f.Phone = storage.NullString(phone)
+	return tx.UpdateOnly(f, "phone", "updated_at")
+}
+
 // UpdateStatus modifies the factor status
 func (f *Factor) UpdateStatus(tx *storage.Connection, state FactorState) error {
 	f.Status = state.String()
 	return tx.UpdateOnly(f, "status", "updated_at")
-}
-
-// UpdateFactorType modifies the factor type
-func (f *Factor) UpdateFactorType(tx *storage.Connection, factorType string) error {
-	f.FactorType = factorType
-	return tx.UpdateOnly(f, "factor_type", "updated_at")
 }
 
 func (f *Factor) DowngradeSessionsToAAL1(tx *storage.Connection) error {
@@ -268,10 +340,6 @@ func (f *Factor) DowngradeSessionsToAAL1(tx *storage.Connection) error {
 		}
 	}
 	return updateFactorAssociatedSessions(tx, f.UserID, f.ID, AAL1.String())
-}
-
-func (f *Factor) IsOwnedBy(user *User) bool {
-	return f.UserID == user.ID
 }
 
 func (f *Factor) IsVerified() bool {

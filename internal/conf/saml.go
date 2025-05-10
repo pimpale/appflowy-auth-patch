@@ -17,6 +17,7 @@ import (
 type SAMLConfiguration struct {
 	Enabled                  bool          `json:"enabled"`
 	PrivateKey               string        `json:"-" split_words:"true"`
+	AllowEncryptedAssertions bool          `json:"allow_encrypted_assertions" split_words:"true"`
 	RelayStateValidityPeriod time.Duration `json:"relay_state_validity_period" split_words:"true"`
 
 	RSAPrivateKey *rsa.PrivateKey   `json:"-"`
@@ -26,6 +27,14 @@ type SAMLConfiguration struct {
 	ExternalURL string `json:"external_url,omitempty" split_words:"true"`
 
 	RateLimitAssertion float64 `default:"15" split_words:"true"`
+}
+
+func (c *SAMLConfiguration) GoString() string { return c.String() }
+func (c *SAMLConfiguration) String() string {
+	if c == nil {
+		return "(*SAMLConfiguration)(nil)"
+	}
+	return fmt.Sprintf("SAMLConfiguration(Enabled: %v)", c.Enabled)
 }
 
 func (c *SAMLConfiguration) Validate() error {
@@ -38,11 +47,6 @@ func (c *SAMLConfiguration) Validate() error {
 		privateKey, err := x509.ParsePKCS1PrivateKey(bytes)
 		if err != nil {
 			return errors.New("SAML private key not in PKCS#1 format")
-		}
-
-		err = privateKey.Validate()
-		if err != nil {
-			return errors.New("SAML private key is not valid")
 		}
 
 		if privateKey.E != 0x10001 {
@@ -73,8 +77,15 @@ func (c *SAMLConfiguration) Validate() error {
 func (c *SAMLConfiguration) PopulateFields(externalURL string) error {
 	// errors are intentionally ignored since they should have been handled
 	// within #Validate()
-	bytes, _ := base64.StdEncoding.DecodeString(c.PrivateKey)
-	privateKey, _ := x509.ParsePKCS1PrivateKey(bytes)
+	bytes, err := base64.StdEncoding.DecodeString(c.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("saml: PopulateFields: invalid base64: %w", err)
+	}
+
+	privateKey, err := x509.ParsePKCS1PrivateKey(bytes)
+	if err != nil {
+		return fmt.Errorf("saml: PopulateFields: invalid private key: %w", err)
+	}
 
 	c.RSAPrivateKey = privateKey
 	c.RSAPublicKey = privateKey.Public().(*rsa.PublicKey)
@@ -111,11 +122,21 @@ func (c *SAMLConfiguration) PopulateFields(externalURL string) error {
 		},
 	}
 
+	if c.AllowEncryptedAssertions {
+		certTemplate.KeyUsage = certTemplate.KeyUsage | x509.KeyUsageDataEncipherment
+	}
+	return c.createCertificate(certTemplate)
+}
+
+func (c *SAMLConfiguration) createCertificate(certTemplate *x509.Certificate) error {
 	certDer, err := x509.CreateCertificate(nil, certTemplate, certTemplate, c.RSAPublicKey, c.RSAPrivateKey)
 	if err != nil {
 		return err
 	}
+	return c.parseCertificateDer(certDer)
+}
 
+func (c *SAMLConfiguration) parseCertificateDer(certDer []byte) error {
 	cert, err := x509.ParseCertificate(certDer)
 	if err != nil {
 		return err
@@ -126,6 +147,5 @@ func (c *SAMLConfiguration) PopulateFields(externalURL string) error {
 	if c.RelayStateValidityPeriod == 0 {
 		c.RelayStateValidityPeriod = 2 * time.Minute
 	}
-
 	return nil
 }

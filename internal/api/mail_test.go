@@ -13,6 +13,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/models"
@@ -46,6 +47,49 @@ func (ts *MailTestSuite) SetupTest() {
 	u, err := models.NewUser("12345678", "test@example.com", "password", ts.Config.JWT.Aud, nil)
 	require.NoError(ts.T(), err, "Error creating new user model")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new user")
+}
+
+func (ts *MailTestSuite) TestValidateEmail() {
+	cases := []struct {
+		desc          string
+		email         string
+		expectedEmail string
+		expectedError error
+	}{
+		{
+			desc:          "valid email",
+			email:         "test@example.com",
+			expectedEmail: "test@example.com",
+			expectedError: nil,
+		},
+		{
+			desc:          "email should be normalized",
+			email:         "TEST@EXAMPLE.COM",
+			expectedEmail: "test@example.com",
+			expectedError: nil,
+		},
+		{
+			desc:          "empty email should return error",
+			email:         "",
+			expectedEmail: "",
+			expectedError: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "An email address is required"),
+		},
+		{
+			desc: "email length exceeds 255 characters",
+			// email has 256 characters
+			email:         "testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest@example.com",
+			expectedEmail: "",
+			expectedError: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "An email address is too long"),
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			email, err := ts.API.validateEmail(c.email)
+			require.Equal(ts.T(), c.expectedError, err)
+			require.Equal(ts.T(), c.expectedEmail, email)
+		})
+	}
 }
 
 func (ts *MailTestSuite) TestGenerateLink() {
@@ -163,6 +207,11 @@ func (ts *MailTestSuite) TestGenerateLink() {
 	customDomainUrl, err := url.ParseRequestURI("https://example.gotrue.com")
 	require.NoError(ts.T(), err)
 
+	originalHosts := ts.API.config.Mailer.ExternalHosts
+	ts.API.config.Mailer.ExternalHosts = []string{
+		"example.gotrue.com",
+	}
+
 	for _, c := range cases {
 		ts.Run(c.Desc, func() {
 			var buffer bytes.Buffer
@@ -196,6 +245,8 @@ func (ts *MailTestSuite) TestGenerateLink() {
 			require.Equal(ts.T(), req.Host, u.Host)
 		})
 	}
+
+	ts.API.config.Mailer.ExternalHosts = originalHosts
 }
 
 func (ts *MailTestSuite) setURIAllowListMap(uris ...string) {

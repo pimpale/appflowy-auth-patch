@@ -1,4 +1,4 @@
-package api
+package apierrors
 
 type ErrorCode = string
 
@@ -18,6 +18,9 @@ const (
 	ErrorCodeNoAuthorization                   ErrorCode = "no_authorization"
 	ErrorCodeUserNotFound                      ErrorCode = "user_not_found"
 	ErrorCodeSessionNotFound                   ErrorCode = "session_not_found"
+	ErrorCodeSessionExpired                    ErrorCode = "session_expired"
+	ErrorCodeRefreshTokenNotFound              ErrorCode = "refresh_token_not_found"
+	ErrorCodeRefreshTokenAlreadyUsed           ErrorCode = "refresh_token_already_used"
 	ErrorCodeFlowStateNotFound                 ErrorCode = "flow_state_not_found"
 	ErrorCodeFlowStateExpired                  ErrorCode = "flow_state_expired"
 	ErrorCodeSignupDisabled                    ErrorCode = "signup_disabled"
@@ -72,17 +75,24 @@ const (
 	ErrorCodeOverRequestRateLimit              ErrorCode = "over_request_rate_limit"
 	ErrorCodeOverEmailSendRateLimit            ErrorCode = "over_email_send_rate_limit"
 	ErrorCodeOverSMSSendRateLimit              ErrorCode = "over_sms_send_rate_limit"
-	ErrorBadCodeVerifier                       ErrorCode = "bad_code_verifier"
+	ErrorCodeBadCodeVerifier                   ErrorCode = "bad_code_verifier"
 	ErrorCodeAnonymousProviderDisabled         ErrorCode = "anonymous_provider_disabled"
 	ErrorCodeHookTimeout                       ErrorCode = "hook_timeout"
 	ErrorCodeHookTimeoutAfterRetry             ErrorCode = "hook_timeout_after_retry"
 	ErrorCodeHookPayloadOverSizeLimit          ErrorCode = "hook_payload_over_size_limit"
+	ErrorCodeHookPayloadInvalidContentType     ErrorCode = "hook_payload_invalid_content_type"
 	ErrorCodeRequestTimeout                    ErrorCode = "request_timeout"
 	ErrorCodeMFAPhoneEnrollDisabled            ErrorCode = "mfa_phone_enroll_not_enabled"
 	ErrorCodeMFAPhoneVerifyDisabled            ErrorCode = "mfa_phone_verify_not_enabled"
 	ErrorCodeMFATOTPEnrollDisabled             ErrorCode = "mfa_totp_enroll_not_enabled"
 	ErrorCodeMFATOTPVerifyDisabled             ErrorCode = "mfa_totp_verify_not_enabled"
+	ErrorCodeMFAWebAuthnEnrollDisabled         ErrorCode = "mfa_webauthn_enroll_not_enabled"
+	ErrorCodeMFAWebAuthnVerifyDisabled         ErrorCode = "mfa_webauthn_verify_not_enabled"
 	ErrorCodeMFAVerifiedFactorExists           ErrorCode = "mfa_verified_factor_exists"
 	//#nosec G101 -- Not a secret value.
-	ErrorCodeInvalidCredentials ErrorCode = "invalid_credentials"
+	ErrorCodeInvalidCredentials        ErrorCode = "invalid_credentials"
+	ErrorCodeEmailAddressNotAuthorized ErrorCode = "email_address_not_authorized"
+	ErrorCodeEmailAddressInvalid       ErrorCode = "email_address_invalid"
+	ErrorCodeWeb3ProviderDisabled      ErrorCode = "web3_provider_disabled"
+	ErrorCodeWeb3UnsupportedChain      ErrorCode = "web3_unsupported_chain"
 )

@@ -11,12 +11,13 @@ import (
 	"sync"
 	"time"
 
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/sirupsen/logrus"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/security"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
+	"github.com/supabase/auth/internal/utilities"
 
 	"github.com/didip/tollbooth/v5"
 	"github.com/didip/tollbooth/v5/limiter"
@@ -56,82 +57,27 @@ func (f *FunctionHooks) UnmarshalJSON(b []byte) error {
 
 var emailRateLimitCounter = observability.ObtainMetricCounter("gotrue_email_rate_limit_counter", "Number of times an email rate limit has been triggered")
 
-func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
-	return func(w http.ResponseWriter, req *http.Request) (context.Context, error) {
-		c := req.Context()
+func (a *API) performRateLimiting(lmt *limiter.Limiter, req *http.Request) error {
+	if limitHeader := a.config.RateLimitHeader; limitHeader != "" {
+		key := req.Header.Get(limitHeader)
 
-		if limitHeader := a.config.RateLimitHeader; limitHeader != "" {
-			key := req.Header.Get(limitHeader)
-
-			if key == "" {
-				log := observability.GetLogEntry(req).Entry
-				log.WithField("header", limitHeader).Warn("request does not have a value for the rate limiting header, rate limiting is not applied")
-				return c, nil
-			} else {
-				err := tollbooth.LimitByKeys(lmt, []string{key})
-				if err != nil {
-					return c, tooManyRequestsError(ErrorCodeOverRequestRateLimit, "Request rate limit reached")
-				}
+		if key == "" {
+			log := observability.GetLogEntry(req).Entry
+			log.WithField("header", limitHeader).Warn("request does not have a value for the rate limiting header, rate limiting is not applied")
+		} else {
+			err := tollbooth.LimitByKeys(lmt, []string{key})
+			if err != nil {
+				return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverRequestRateLimit, "Request rate limit reached")
 			}
 		}
-		return c, nil
 	}
+
+	return nil
 }
 
-func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
-	// limit per hour
-	emailFreq := a.config.RateLimitEmailSent / (60 * 60)
-	smsFreq := a.config.RateLimitSmsSent / (60 * 60)
-
-	emailLimiter := tollbooth.NewLimiter(emailFreq, &limiter.ExpirableOptions{
-		DefaultExpirationTTL: time.Hour,
-	}).SetBurst(int(a.config.RateLimitEmailSent)).SetMethods([]string{"PUT", "POST"})
-
-	phoneLimiter := tollbooth.NewLimiter(smsFreq, &limiter.ExpirableOptions{
-		DefaultExpirationTTL: time.Hour,
-	}).SetBurst(int(a.config.RateLimitSmsSent)).SetMethods([]string{"PUT", "POST"})
-
+func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 	return func(w http.ResponseWriter, req *http.Request) (context.Context, error) {
-		c := req.Context()
-		config := a.config
-		shouldRateLimitEmail := config.External.Email.Enabled && !config.Mailer.Autoconfirm
-		shouldRateLimitPhone := config.External.Phone.Enabled && !config.Sms.Autoconfirm
-
-		if shouldRateLimitEmail || shouldRateLimitPhone {
-			if req.Method == "PUT" || req.Method == "POST" {
-				var requestBody struct {
-					Email string `json:"email"`
-					Phone string `json:"phone"`
-				}
-
-				if err := retrieveRequestParams(req, &requestBody); err != nil {
-					return c, err
-				}
-
-				if shouldRateLimitEmail {
-					if requestBody.Email != "" {
-						if err := tollbooth.LimitByKeys(emailLimiter, []string{"email_functions"}); err != nil {
-							emailRateLimitCounter.Add(
-								req.Context(),
-								1,
-								metric.WithAttributeSet(attribute.NewSet(attribute.String("path", req.URL.Path))),
-							)
-							return c, tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, "Email rate limit exceeded")
-						}
-					}
-				}
-
-				if shouldRateLimitPhone {
-					if requestBody.Phone != "" {
-						if err := tollbooth.LimitByKeys(phoneLimiter, []string{"phone_functions"}); err != nil {
-							return c, tooManyRequestsError(ErrorCodeOverSMSSendRateLimit, "SMS rate limit exceeded")
-						}
-					}
-				}
-			}
-		}
-
-		return c, nil
+		return req.Context(), a.performRateLimiting(lmt, req)
 	}
 }
 
@@ -143,7 +89,6 @@ func (a *API) requireAdminCredentials(w http.ResponseWriter, req *http.Request) 
 
 	ctx, err := a.parseJWTClaims(t, req)
 	if err != nil {
-		a.clearCookieTokens(a.config, w)
 		return nil, err
 	}
 
@@ -155,7 +100,7 @@ func (a *API) requireEmailProvider(w http.ResponseWriter, req *http.Request) (co
 	config := a.config
 
 	if !config.External.Email.Enabled {
-		return nil, badRequestError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeEmailProviderDisabled, "Email logins are disabled")
 	}
 
 	return ctx, nil
@@ -176,24 +121,45 @@ func (a *API) verifyCaptcha(w http.ResponseWriter, req *http.Request) (context.C
 		return ctx, nil
 	}
 
-	verificationResult, err := security.VerifyRequest(req, strings.TrimSpace(config.Security.Captcha.Secret), config.Security.Captcha.Provider)
+	body := &security.GotrueRequest{}
+	if err := retrieveRequestParams(req, body); err != nil {
+		return nil, err
+	}
+
+	verificationResult, err := security.VerifyRequest(body, utilities.GetIPAddress(req), strings.TrimSpace(config.Security.Captcha.Secret), config.Security.Captcha.Provider)
 	if err != nil {
-		return nil, internalServerError("captcha verification process failed").WithInternalError(err)
+		return nil, apierrors.NewInternalServerError("captcha verification process failed").WithInternalError(err)
 	}
 
 	if !verificationResult.Success {
-		return nil, badRequestError(ErrorCodeCaptchaFailed, "captcha protection: request disallowed (%s)", strings.Join(verificationResult.ErrorCodes, ", "))
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeCaptchaFailed, "captcha protection: request disallowed (%s)", strings.Join(verificationResult.ErrorCodes, ", "))
 	}
 
 	return ctx, nil
 }
 
 func isIgnoreCaptchaRoute(req *http.Request) bool {
-	// captcha shouldn't be enabled on the following grant_types
-	// id_token, refresh_token, pkce
-	if req.URL.Path == "/token" && req.FormValue("grant_type") != "password" {
-		return true
+	if req.URL.Path != "/token" {
+		return false
 	}
+
+	switch req.FormValue("grant_type") {
+	case "pkce":
+		return true
+
+	case "refresh_token":
+		return true
+
+	case "id_token":
+		return true
+
+	case "password":
+		return false
+
+	case "web3":
+		return false
+	}
+
 	return false
 }
 
@@ -201,32 +167,92 @@ func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (con
 	ctx := req.Context()
 	config := a.config
 
-	var u *url.URL
-	var err error
-
-	baseUrl := config.API.ExternalURL
 	xForwardedHost := req.Header.Get("X-Forwarded-Host")
 	xForwardedProto := req.Header.Get("X-Forwarded-Proto")
-	if xForwardedHost != "" && xForwardedProto != "" {
-		baseUrl = fmt.Sprintf("%s://%s", xForwardedProto, xForwardedHost)
-	} else if req.URL.Scheme != "" && req.URL.Hostname() != "" {
-		baseUrl = fmt.Sprintf("%s://%s", req.URL.Scheme, req.URL.Hostname())
-	}
-	if u, err = url.ParseRequestURI(baseUrl); err != nil {
-		// fallback to the default hostname
-		log := observability.GetLogEntry(req).Entry
-		log.WithField("request_url", baseUrl).Warn(err)
-		if u, err = url.ParseRequestURI(config.API.ExternalURL); err != nil {
-			return ctx, err
+	reqHost := req.URL.Hostname()
+
+	if len(config.Mailer.ExternalHosts) > 0 {
+		// this server is configured to accept multiple external hosts, validate the host from the X-Forwarded-Host or Host headers
+
+		hostname := ""
+		protocol := "https"
+
+		if xForwardedHost != "" {
+			for _, host := range config.Mailer.ExternalHosts {
+				if host == xForwardedHost {
+					hostname = host
+					break
+				}
+			}
+		} else if reqHost != "" {
+			for _, host := range config.Mailer.ExternalHosts {
+				if host == reqHost {
+					hostname = host
+					break
+				}
+			}
+		}
+
+		if hostname != "" {
+			if hostname == "localhost" {
+				// allow the use of HTTP only if the accepted hostname was localhost
+				if xForwardedProto == "http" || req.URL.Scheme == "http" {
+					protocol = "http"
+				}
+			}
+
+			externalHostURL, err := url.ParseRequestURI(fmt.Sprintf("%s://%s", protocol, hostname))
+			if err != nil {
+				return ctx, err
+			}
+
+			return withExternalHost(ctx, externalHostURL), nil
 		}
 	}
-	return withExternalHost(ctx, u), nil
+
+	if xForwardedHost != "" || reqHost != "" {
+		// host has been provided to the request, but it hasn't been
+		// added to the allow list, raise a log message
+		// in Supabase platform the X-Forwarded-Host and full request
+		// URL are likely sanitzied before they reach the server
+
+		fields := make(logrus.Fields)
+
+		if xForwardedHost != "" {
+			fields["x_forwarded_host"] = xForwardedHost
+		}
+
+		if xForwardedProto != "" {
+			fields["x_forwarded_proto"] = xForwardedProto
+		}
+
+		if reqHost != "" {
+			fields["request_url_host"] = reqHost
+
+			if req.URL.Scheme != "" {
+				fields["request_url_scheme"] = req.URL.Scheme
+			}
+		}
+
+		logrus.WithFields(fields).Info("Request received external host in X-Forwarded-Host or Host headers, but the values have not been added to GOTRUE_MAILER_EXTERNAL_HOSTS and will not be used. To suppress this message add the host, or sanitize the headers before the request reaches Auth.")
+	}
+
+	// either the provided external hosts don't match the allow list, or
+	// the server is not configured to accept multiple hosts -- use the
+	// configured external URL instead
+
+	externalHostURL, err := url.ParseRequestURI(config.API.ExternalURL)
+	if err != nil {
+		return ctx, err
+	}
+
+	return withExternalHost(ctx, externalHostURL), nil
 }
 
 func (a *API) requireSAMLEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
 	ctx := req.Context()
 	if !a.config.SAML.Enabled {
-		return nil, notFoundError(ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled")
+		return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled")
 	}
 	return ctx, nil
 }
@@ -234,20 +260,23 @@ func (a *API) requireSAMLEnabled(w http.ResponseWriter, req *http.Request) (cont
 func (a *API) requireManualLinkingEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
 	ctx := req.Context()
 	if !a.config.Security.ManualLinkingEnabled {
-		return nil, notFoundError(ErrorCodeManualLinkingDisabled, "Manual linking is disabled")
+		return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeManualLinkingDisabled, "Manual linking is disabled")
 	}
 	return ctx, nil
 }
 
-func (a *API) databaseCleanup(cleanup *models.Cleanup) func(http.Handler) http.Handler {
+func (a *API) databaseCleanup(cleanup models.Cleaner) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r)
-
+			wrappedResp := chimiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(wrappedResp, r)
 			switch r.Method {
 			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				if (wrappedResp.Status() / 100) != 2 {
+					// don't do any cleanups for non-2xx responses
+					return
+				}
 				// continue
-
 			default:
 				return
 			}
@@ -371,7 +400,7 @@ func timeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
 				if err == context.DeadlineExceeded {
 					httpError := &HTTPError{
 						HTTPStatus: http.StatusGatewayTimeout,
-						ErrorCode:  ErrorCodeRequestTimeout,
+						ErrorCode:  apierrors.ErrorCodeRequestTimeout,
 						Message:    "Processing this request timed out, please retry after a moment.",
 					}
 

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/models"
@@ -34,6 +35,9 @@ type TestSmsProvider struct {
 func (t *TestSmsProvider) SendMessage(phone, message, channel, otp string) (string, error) {
 	t.SentMessages += 1
 	return "", nil
+}
+func (t *TestSmsProvider) VerifyOTP(phone, otp string) error {
+	return nil
 }
 
 func TestPhone(t *testing.T) {
@@ -96,7 +100,7 @@ func doTestSendPhoneConfirmation(ts *PhoneTestSuite, useTestOTP bool) {
 		{
 			desc:     "send invalid otp type ",
 			otpType:  "invalid otp type",
-			expected: internalServerError("invalid otp type"),
+			expected: apierrors.NewInternalServerError("invalid otp type"),
 		},
 	}
 

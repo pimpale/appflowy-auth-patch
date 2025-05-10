@@ -1,13 +1,13 @@
 openapi: 3.0.3
 info:
   version: latest
-  title: GoTrue REST API (Supabase Auth)
+  title: Supabase Auth REST API
   description: |-
-    GoTrue is the software behind [Supabase Auth](https://supabase.com/auth). This is its REST API.
+    This is the REST API for [Supabase Auth](https://supabase.com/auth). Visit https://supabase.com/docs/guides/auth for complete documentation.
 
     **Notes:**
     - HTTP 5XX errors are not listed for each endpoint.
-      These should be handled globally. Not all HTTP 5XX errors are generated from GoTrue, and they may serve non-JSON content. Make sure you inspect the `Content-Type` header before parsing as JSON.
+      These should be handled globally. Not all HTTP 5XX errors are generated from Auth, and they may serve non-JSON content. Make sure you inspect the `Content-Type` header before parsing as JSON.
     - Error responses are somewhat inconsistent.
       Avoid using the `msg` and HTTP status code to identify errors. HTTP 400 and 422 are used interchangeably in many APIs.
     - If the server has CAPTCHA protection enabled, the verification token should be included in the request body.
@@ -25,7 +25,7 @@ info:
     url: https://github.com/supabase/supabase/discussions
   license:
     name: MIT License
-    url: https://github.com/supabase/gotrue/blob/master/LICENSE
+    url: https://github.com/supabase/auth/blob/master/LICENSE
 externalDocs:
   description: Learn more about Supabase Auth
   url: https://supabase.com/docs/guides/auth/overview
@@ -43,8 +43,6 @@ tags:
     description: APIs used by a user to manage their account.
   - name: oauth
     description: APIs for dealing with OAuth flows.
-  - name: oidc
-    description: APIs for dealing with OIDC authentication flows. (Experimental.)
   - name: sso
     description: APIs for authenticating using SSO providers (SAML). (Experimental.)
   - name: saml
@@ -59,13 +57,18 @@ paths:
       summary: Issues access and refresh tokens based on grant type.
       tags:
         - auth
-        - oidc
       parameters:
         - name: grant_type
           in: query
           required: true
           description: >
-            What grant type should be used to issue an access and refresh token. Note that `id_token` is only offered in experimental mode. CAPTCHA protection is not effective on the `refresh_token` grant flow.
+            - What grant type should be used to issue an access and refresh token. Note: `id_token` is only offered in experimental mode. 
+
+            - CAPTCHA protection does not apply on the `refresh_token` grant flow.
+
+            - Using `password` is akin to a user signing in. 
+
+            - `pkce` is used for exchanging the authorization code for a pair of access and refresh tokens.
           schema:
             type: string
             enum:
@@ -73,6 +76,7 @@ paths:
               - refresh_token
               - id_token
               - pkce
+              - web3
       security:
         - APIKeyAuth: []
       requestBody:
@@ -90,12 +94,18 @@ paths:
                 value:
                   auth_code: 009e5066-fc11-4eca-8c8c-6fd82aa263f2
                   code_verifier: ktPNXpR65N6JtgzQA8_5HHtH6PBSAahMNoLKRzQEa0Tzgl.vdV~b6lPk004XOd.4lR0inCde.NoQx5K63xPfzL8o7tJAjXncnhw5Niv9ycQ.QRV9JG.y3VapqbgLfIrJ
+              grant_type=web3:
+                value:
+                  message: "example.com wants you to sign in with your Solana account:\n0x1234...5678\n\nSign in with Solana\n\nURI: https://example.com\nVersion: 1\nNonce: abc123def456\nIssued At: 2023-09-19T12:00:00Z"
+                  signature: "base64_encoded_signature_string"
+                  chain: "solana"
             schema:
               type: object
               description: |-
                 For the refresh token flow, supply only `refresh_token`.
                 For the email/phone with password flow, supply `email`, `phone` and `password` with an optional `gotrue_meta_security`.
                 For the OIDC ID token flow, supply `id_token`, `nonce`, `provider`, `client_id`, `issuer` with an optional `gotrue_meta_security`.
+                For the Web3 flow, supply `message`, `signature`, and `chain`.
               properties:
                 refresh_token:
                   type: string
@@ -128,12 +138,25 @@ paths:
                   type: string
                   description: If `provider` is `azure` then you can specify any Azure OIDC issuer string here, which will be used for verification.
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
                 auth_code:
                   type: string
                   format: uuid
                 code_verifier:
                   type: string
+                message:
+                  type: string
+                  description: |
+                    Signed message for Web3 authentication following the Sign in with Solana standard. Must include: `Issued At`, `URI`, `Version`.
+                signature:
+                  type: string
+                  description: The signature of the message for Web3 authentication encoded as Base64 or Base64-URL.
+                chain:
+                  type: string
+                  description: What blockchain is the Web3 message and signature for.
+                  enum:
+                    - solana
+                  example: solana
       responses:
         200:
           description: >
@@ -372,7 +395,7 @@ paths:
                     - plain
                     - s256
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: >
@@ -416,7 +439,7 @@ paths:
                     - plain
                     - s256
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: A recovery email has been sent to the address. An empty JSON object is returned. To obfuscate whether such an email address already exists in the system this response is sent regardless whether the address exists or not.
@@ -468,7 +491,7 @@ paths:
                     - sms
                     - phone_change
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: A One-Time Password was sent to the email or phone. To obfuscate whether such an address or number already exists in the system this response is sent in both cases.
@@ -514,7 +537,7 @@ paths:
                 data:
                   type: object
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: A recovery email has been sent to the address. An empty JSON object is returned. To obfuscate whether such an email address already exists in the system this response is sent regardless whether the address exists or not.
@@ -569,7 +592,7 @@ paths:
                 code_challenge:
                   type: string
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: A One-Time Password was sent to the email or phone. To obfuscate whether such an address or number already exists in the system this response is sent in both cases.
@@ -651,6 +674,136 @@ paths:
         429:
           $ref: "#/components/responses/RateLimitResponse"
 
+  /user/identities/authorize:
+    get:
+      summary: Links an OAuth identity to an existing user. Redirects to an external OAuth provider.
+      tags:
+        - user
+      security:
+        - APIKeyAuth: []
+          UserAuth: []
+      parameters:
+        - name: provider
+          in: query
+          description: Name of the OAuth provider.
+          example: google
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-zA-Z0-9]+$"
+        - name: scopes
+          in: query
+          required: true
+          description: Space separated list of OAuth scopes to pass on to `provider`.
+          schema:
+            type: string
+            pattern: "[^ ]+( +[^ ]+)*"
+        - name: redirect_to
+          in: query
+          description: >
+            (Optional) URL to redirect back into the app on after OAuth sign-in completes successfully or not. If not specified will use the "Site URL" configuration option. If not allowed per the allow list it will use the "Site URL" configuration option.
+          schema:
+            type: string
+            format: uri
+        - name: code_challenge_method
+          in: query
+          description: (Optional) Method used to encrypt the verifier. Can be `plain` (no transformation) or `s256` (where SHA-256 is used). It is always recommended that `s256` is used.
+          schema:
+            type: string
+            enum:
+              - plain
+              - s256
+      responses:
+        302:
+          $ref: "#/components/responses/OAuthAuthorizeRedirectResponse"
+    
+  /user/identities/{identityId}:
+    parameters:
+      - name: identityId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      summary: Unlinks an identity from the current user.
+      tags:
+        - user
+      security:
+        - APIKeyAuth: []
+          UserAuth: []
+      responses:
+        200:
+          description: User's account data.
+          content:
+            application/json:
+              schema:
+                type: object
+        401:
+          description: The user is not authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/responses/UnauthorizedResponse"
+              examples:
+                example:
+                  summary: no_authorization
+                  value:
+                    error_code: no_authorization
+        403:
+          description: Forbidden error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/responses/ForbiddenResponse"
+              examples:
+                example:
+                  summary: bad_jwt
+                  value:
+                    error_code: bad_jwt
+                example1:
+                  summary: unexpected_audience
+                  value:
+                    error_code: unexpected_audience
+        404:
+          description: Not found error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorSchema"
+              examples:
+                example:
+                  summary: manual_linking_disabled
+                  value:
+                    error_code: manual_linking_disabled
+                example1:
+                  summary: validation_failed
+                  value:
+                    error_code: validation_failed
+        422: 
+          description: Unprocessable entity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorSchema"
+              examples:
+                example:
+                  summary: single_identity_not_deletable
+                  value:
+                    error_code: single_identity_not_deletable
+                example1:
+                  summary: identity_already_exists
+                  value:
+                    error_code: identity_already_exists
+                example2:
+                  summary: identity_not_found
+                  value:
+                    error_code: identity_not_found
+                example3:
+                  summary: email_conflict_identity_not_deletable
+                  value:
+                    error_code: email_conflict_identity_not_deletable
+
   /reauthenticate:
     post:
       summary: Reauthenticates the possession of an email or phone number for the purpose of password change.
@@ -694,6 +847,7 @@ paths:
                   enum:
                     - totp
                     - phone
+                    - webauthn
                 friendly_name:
                   type: string
                 issuer:
@@ -718,6 +872,7 @@ paths:
                     enum:
                       - totp
                       - phone
+                      - webauthn
                   totp:
                     type: object
                     properties:
@@ -730,6 +885,7 @@ paths:
                   phone:
                     type: string
                     format: phone
+
         400:
           $ref: "#/components/responses/BadRequestResponse"
 
@@ -768,17 +924,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                    format: uuid
-                    example: 14c1560e-2749-4522-bb62-d1458451830a
-                    description: ID of the challenge.
-                  expires_at:
-                    type: integer
-                    example: 1674840917
-                    description: UNIX seconds of the timestamp past which the challenge should not be verified.
+                oneOf:
+                  - $ref: '#/components/schemas/TOTPPhoneChallengeResponse'
+                  - $ref: '#/components/schemas/WebAuthnChallengeResponse'
         400:
           $ref: "#/components/responses/BadRequestResponse"
         429:
@@ -915,7 +1063,7 @@ paths:
                     - plain
                     - s256
                 gotrue_meta_security:
-                  $ref: "#/components/schemas/GoTrueMetaSecurity"
+                  $ref: "#/components/schemas/GoTrueSecurity"
       responses:
         200:
           description: >
@@ -953,7 +1101,8 @@ paths:
         The metadata XML can be downloaded or used for the SAML 2.0 Metadata URL discovery mechanism. This URL is the SAML 2.0 EntityID of the Service Provider implemented by this server.
       tags:
         - saml
-      security: []
+      security:
+        - APIKeyAuth: []
       parameters:
         - name: download
           in: query
@@ -1055,7 +1204,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorSchema"
 
-  /generate_link:
+  /admin/generate_link:
     post:
       summary: Generate a link to send in an email message.
       tags:
@@ -1150,13 +1299,13 @@ paths:
           in: query
           schema:
             type: integer
-            min: 1
+            minimum: 1
             default: 1
         - name: per_page
           in: query
           schema:
             type: integer
-            min: 1
+            minimum: 1
             default: 50
       responses:
         200:
@@ -1245,13 +1394,13 @@ paths:
           in: query
           schema:
             type: integer
-            min: 1
+            minimum: 1
             default: 1
         - name: per_page
           in: query
           schema:
             type: integer
-            min: 1
+            minimum: 1
             default: 50
       responses:
         200:
@@ -1705,10 +1854,6 @@ paths:
                     optional: true
                     example: twilio
                     description: Which SMS provider is being used to send messages to phone numbers.
-                  mfa_enabled:
-                    type: boolean
-                    example: true
-                    description: Whether MFA is enabled on this API server. Defaults to false.
                   saml_enabled:
                     type: boolean
                     example: true
@@ -1747,7 +1892,7 @@ components:
         When deployed on Supabase, this server requires an `apikey` header containing a valid Supabase-issued API key to call any endpoint.
 
   schemas:
-    GoTrueMetaSecurity:
+    GoTrueSecurity:
       type: object
       description: >
         Use this property to pass a CAPTCHA token only if you have enabled CAPTCHA protection.
@@ -1783,6 +1928,10 @@ components:
           type: string
           description: >
             A basic message describing the problem with the request. Usually missing if `error` is present.
+        error_code:
+          type: string
+          description: >
+            A short code used to describe the class of error encountered.
         weak_password:
           type: object
           description: >
@@ -1980,9 +2129,23 @@ components:
             Usually one of:
             - totp
             - phone
+            - webauthn
+        web_authn_credential:
+          type: string
         phone:
           type: string
           format: phone
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_challenged_at:
+          type: string
+          format: date-time
+          nullable: true
 
 
     IdentitySchema:
@@ -2013,6 +2176,252 @@ components:
         email:
           type: string
           format: email
+    TOTPPhoneChallengeResponse:
+      type: object
+      required:
+        - id
+        - type
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 14c1560e-2749-4522-bb62-d1458451830a
+          description: ID of the challenge.
+        type:
+          type: string
+          enum: [totp, phone]
+          description: Type of the challenge.
+        expires_at:
+          type: integer
+          example: 1674840917
+          description: UNIX seconds of the timestamp past which the challenge should not be verified.
+
+    WebAuthnChallengeResponse:
+      type: object
+      required:
+        - id
+        - type
+        - expires_at
+        - credential_options
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 14c1560e-2749-4522-bb62-d1458451830a
+          description: ID of the challenge.
+        type:
+          type: string
+          enum: [webauthn]
+          description: Type of the challenge.
+        expires_at:
+          type: integer
+          example: 1674840917
+          description: UNIX seconds of the timestamp past which the challenge should not be verified.
+        credential_request_options:
+          $ref: '#/components/schemas/CredentialRequestOptions'
+        credential_creation_options:
+          $ref: '#/components/schemas/CredentialCreationOptions'
+
+    CredentialAssertion:
+      type: object
+      description: WebAuthn credential assertion options
+      required:
+        - challenge
+        - rpId
+        - allowCredentials
+        - timeout
+      properties:
+        challenge:
+          type: string
+          description: A random challenge generated by the server, base64url encoded
+          example: "Y2hhbGxlbmdlAyv-5P0kw1SG-OxhLbSHpRLdWaVR1w"
+        rpId:
+          type: string
+          description: The relying party's identifier (usually the domain name)
+          example: "example.com"
+        allowCredentials:
+          type: array
+          description: List of credentials acceptable for this authentication
+          items:
+            type: object
+            required:
+              - id
+              - type
+            properties:
+              id:
+                type: string
+                description: Credential ID, base64url encoded
+                example: "AXwyVxYT7BgNKwNq0YqUXaHHIdRK6OdFGCYgZF9K6zNu"
+              type:
+                type: string
+                enum: [public-key]
+                description: Type of the credential
+        timeout:
+          type: integer
+          description: Time (in milliseconds) that the user has to respond to the authentication prompt
+          example: 60000
+        userVerification:
+          type: string
+          enum: [required, preferred, discouraged]
+          description: The relying party's requirements for user verification
+          default: preferred
+        extensions:
+          type: object
+          description: Additional parameters requesting additional processing by the client
+        status:
+          type: string
+          enum: [ok, failed]
+          description: Status of the credential assertion
+        errorMessage:
+          type: string
+          description: Error message if the assertion failed
+        userHandle:
+          type: string
+          description: User handle, base64url encoded
+        authenticatorAttachment:
+          type: string
+          enum: [platform, cross-platform]
+          description: Type of authenticator to use
+
+    CredentialRequest:
+      type: object
+      description: WebAuthn credential request (for the response from the client)
+      required:
+        - id
+        - rawId
+        - type
+        - response
+      properties:
+        id:
+          type: string
+          description: Base64url encoding of the credential ID
+          example: "AXwyVxYT7BgNKwNq0YqUXaHHIdRK6OdFGCYgZF9K6zNu"
+        rawId:
+          type: string
+          description: Base64url encoding of the credential ID (same as id)
+          example: "AXwyVxYT7BgNKwNq0YqUXaHHIdRK6OdFGCYgZF9K6zNu"
+        type:
+          type: string
+          enum: [public-key]
+          description: Type of the credential
+        response:
+          type: object
+          required:
+            - clientDataJSON
+            - authenticatorData
+            - signature
+            - userHandle
+          properties:
+            clientDataJSON:
+              type: string
+              description: Base64url encoding of the client data
+              example: "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiY2hhbGxlbmdlIiwib3JpZ2luIjoiaHR0cHM6Ly9leGFtcGxlLmNvbSJ9"
+            authenticatorData:
+              type: string
+              description: Base64url encoding of the authenticator data
+              example: "SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MBAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAXwyVxYT7BgNKwNq0YqUXaHHIdRK6OdFGCYgZF9K6zNu"
+            signature:
+              type: string
+              description: Base64url encoding of the signature
+              example: "MEUCIQCx5cJVAB3kGP6bqCIoAV6CkBpVAf8rcx0WSZ22fIxXvQIgCKFt9pEu1vK8U4JKYTfn6tGjvGNfx2F4uXrHSXlefvM"
+            userHandle:
+              type: string
+              description: Base64url encoding of the user handle
+              example: "MQ"
+        clientExtensionResults:
+          type: object
+          description: Client extension results
+
+    CredentialRequestOptions:
+      type: object
+      description: Options for requesting an assertion
+      properties:
+        challenge:
+          type: string
+          format: byte
+          description: A challenge to be signed by the authenticator
+        timeout:
+          type: integer
+          description: Time (in milliseconds) that the caller is willing to wait for the call to complete
+        rpId:
+          type: string
+          description: Relying Party ID
+        allowCredentials:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicKeyCredentialDescriptor'
+        userVerification:
+          type: string
+          enum: [required, preferred, discouraged]
+          description: User verification requirement
+
+    CredentialCreationOptions:
+      type: object
+      description: Options for creating a new credential
+      properties:
+        rp:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+        user:
+          $ref: '#/components/schemas/UserSchema'
+
+        challenge:
+          type: string
+          format: byte
+          description: A challenge to be signed by the authenticator
+        pubKeyCredParams:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [public-key]
+              alg:
+                type: integer
+        timeout:
+          type: integer
+          description: Time (in milliseconds) that the caller is willing to wait for the call to complete
+        excludeCredentials:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicKeyCredentialDescriptor'
+        authenticatorSelection:
+          type: object
+          properties:
+            authenticatorAttachment:
+              type: string
+              enum: [platform, cross-platform]
+            requireResidentKey:
+              type: boolean
+            userVerification:
+              type: string
+              enum: [required, preferred, discouraged]
+        attestation:
+          type: string
+          enum: [none, indirect, direct]
+          description: Preferred attestation conveyance
+
+    PublicKeyCredentialDescriptor:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [public-key]
+        id:
+          type: string
+          format: byte
+          description: Credential ID
+        transports:
+          type: array
+          items:
+            type: string
+            enum: [usb, nfc, ble, internal]
 
   responses:
     OAuthCallbackRedirectResponse:

@@ -5,12 +5,12 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/didip/tollbooth/v5"
-	"github.com/didip/tollbooth/v5/limiter"
 	"github.com/rs/cors"
 	"github.com/sebest/xff"
 	"github.com/sirupsen/logrus"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/hooks"
 	"github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
@@ -33,10 +33,20 @@ type API struct {
 	config  *conf.GlobalConfiguration
 	version string
 
+	hooksMgr   *hooks.Manager
 	hibpClient *hibp.PwnedClient
 
 	// overrideTime can be used to override the clock used by handlers. Should only be used in tests!
 	overrideTime func() time.Time
+
+	limiterOpts *LimiterOptions
+}
+
+func (a *API) GetConfig() *conf.GlobalConfiguration { return a.config }
+func (a *API) GetDB() *storage.Connection           { return a.db }
+
+func (a *API) Version() string {
+	return a.version
 }
 
 func (a *API) Now() time.Time {
@@ -48,8 +58,8 @@ func (a *API) Now() time.Time {
 }
 
 // NewAPI instantiates a new REST API
-func NewAPI(globalConfig *conf.GlobalConfiguration, db *storage.Connection) *API {
-	return NewAPIWithVersion(globalConfig, db, defaultVersion)
+func NewAPI(globalConfig *conf.GlobalConfiguration, db *storage.Connection, opt ...Option) *API {
+	return NewAPIWithVersion(globalConfig, db, defaultVersion, opt...)
 }
 
 func (a *API) deprecationNotices() {
@@ -67,9 +77,18 @@ func (a *API) deprecationNotices() {
 }
 
 // NewAPIWithVersion creates a new REST API using the specified version
-func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Connection, version string) *API {
+func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Connection, version string, opt ...Option) *API {
 	api := &API{config: globalConfig, db: db, version: version}
 
+	for _, o := range opt {
+		o.apply(api)
+	}
+	if api.limiterOpts == nil {
+		api.limiterOpts = NewLimiterOptions(globalConfig)
+	}
+	if api.hooksMgr == nil {
+		api.hooksMgr = hooks.NewManager(db, globalConfig)
+	}
 	if api.config.Password.HIBP.Enabled {
 		httpClient := &http.Client{
 			// all HIBP API requests should finish quickly to avoid
@@ -127,24 +146,18 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 	})
 
 	r.Route("/", func(r *router) {
+
 		r.Use(api.isValidExternalHost)
 
 		r.Get("/settings", api.Settings)
 
 		r.Get("/authorize", api.ExternalProviderRedirect)
 
-		sharedLimiter := api.limitEmailOrPhoneSentHandler()
-		r.With(sharedLimiter).With(api.requireAdminCredentials).Post("/invite", api.Invite)
-		r.With(sharedLimiter).With(api.verifyCaptcha).Route("/signup", func(r *router) {
+		r.With(api.requireAdminCredentials).Post("/invite", api.Invite)
+		r.With(api.verifyCaptcha).Route("/signup", func(r *router) {
 			// rate limit per hour
-			limitAnonymousSignIns := tollbooth.NewLimiter(api.config.RateLimitAnonymousUsers/(60*60), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(int(api.config.RateLimitAnonymousUsers)).SetMethods([]string{"POST"})
-
-			limitSignups := tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30)
-
+			limitAnonymousSignIns := api.limiterOpts.AnonymousSignIns
+			limitSignups := api.limiterOpts.Signups
 			r.Post("/", func(w http.ResponseWriter, r *http.Request) error {
 				params := &SignupParams{}
 				if err := retrieveRequestParams(r, params); err != nil {
@@ -152,7 +165,7 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 				}
 				if params.Email == "" && params.Phone == "" {
 					if !api.config.External.AnonymousUsers.Enabled {
-						return unprocessableEntityError(ErrorCodeAnonymousProviderDisabled, "Anonymous sign-ins are disabled")
+						return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeAnonymousProviderDisabled, "Anonymous sign-ins are disabled")
 					}
 					if _, err := api.limitHandler(limitAnonymousSignIns)(w, r); err != nil {
 						return err
@@ -164,54 +177,25 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 				if _, err := api.limitHandler(limitSignups)(w, r); err != nil {
 					return err
 				}
-				// apply shared rate limiting on email / phone
-				if _, err := sharedLimiter(w, r); err != nil {
-					return err
-				}
 				return api.Signup(w, r)
 			})
 		})
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes
-			tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).With(sharedLimiter).With(api.verifyCaptcha).With(api.requireEmailProvider).Post("/recover", api.Recover)
+		r.With(api.limitHandler(api.limiterOpts.Recover)).
+			With(api.verifyCaptcha).With(api.requireEmailProvider).Post("/recover", api.Recover)
 
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes
-			tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).With(sharedLimiter).With(api.verifyCaptcha).Post("/resend", api.Resend)
+		r.With(api.limitHandler(api.limiterOpts.Resend)).
+			With(api.verifyCaptcha).Post("/resend", api.Resend)
 
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes
-			tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).With(sharedLimiter).With(api.verifyCaptcha).Post("/magiclink", api.MagicLink)
+		r.With(api.limitHandler(api.limiterOpts.MagicLink)).
+			With(api.verifyCaptcha).Post("/magiclink", api.MagicLink)
 
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes
-			tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).With(sharedLimiter).With(api.verifyCaptcha).Post("/otp", api.Otp)
+		r.With(api.limitHandler(api.limiterOpts.Otp)).
+			With(api.verifyCaptcha).Post("/otp", api.Otp)
 
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes.
-			tollbooth.NewLimiter(api.config.RateLimitTokenRefresh/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).With(api.verifyCaptcha).Post("/token", api.Token)
+		// rate limiting applied in handler
+		r.With(api.verifyCaptcha).Post("/token", api.Token)
 
-		r.With(api.limitHandler(
-			// Allow requests at the specified rate per 5 minutes.
-			tollbooth.NewLimiter(api.config.RateLimitVerify/(60*5), &limiter.ExpirableOptions{
-				DefaultExpirationTTL: time.Hour,
-			}).SetBurst(30),
-		)).Route("/verify", func(r *router) {
+		r.With(api.limitHandler(api.limiterOpts.Verify)).Route("/verify", func(r *router) {
 			r.Get("/", api.Verify)
 			r.Post("/", api.Verify)
 		})
@@ -224,6 +208,7 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 
 		r.With(api.requireAuthentication).Route("/user", func(r *router) {
 			r.Get("/", api.UserGet)
+<<<<<<< HEAD
 			r.Get("/auth-info", api.UserAuthInfoGet)
 			r.With(api.limitHandler(
 				// Allow requests at the specified rate per 5 minutes
@@ -231,6 +216,9 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 					DefaultExpirationTTL: time.Hour,
 				}).SetBurst(30),
 			)).With(sharedLimiter).Put("/", api.UserUpdate)
+=======
+			r.With(api.limitHandler(api.limiterOpts.User)).Put("/", api.UserUpdate)
+>>>>>>> upstream/master
 
 			r.Route("/change-password", func(r *router) {
 				r.With(api.limitHandler(
@@ -254,14 +242,10 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 			r.Route("/{factor_id}", func(r *router) {
 				r.Use(api.loadFactor)
 
-				r.With(api.limitHandler(
-					tollbooth.NewLimiter(api.config.MFA.RateLimitChallengeAndVerify/60, &limiter.ExpirableOptions{
-						DefaultExpirationTTL: time.Minute,
-					}).SetBurst(30))).Post("/verify", api.VerifyFactor)
-				r.With(api.limitHandler(
-					tollbooth.NewLimiter(api.config.MFA.RateLimitChallengeAndVerify/60, &limiter.ExpirableOptions{
-						DefaultExpirationTTL: time.Minute,
-					}).SetBurst(30))).Post("/challenge", api.ChallengeFactor)
+				r.With(api.limitHandler(api.limiterOpts.FactorVerify)).
+					Post("/verify", api.VerifyFactor)
+				r.With(api.limitHandler(api.limiterOpts.FactorChallenge)).
+					Post("/challenge", api.ChallengeFactor)
 				r.Delete("/", api.UnenrollFactor)
 
 			})
@@ -269,22 +253,14 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 
 		r.Route("/sso", func(r *router) {
 			r.Use(api.requireSAMLEnabled)
-			r.With(api.limitHandler(
-				// Allow requests at the specified rate per 5 minutes.
-				tollbooth.NewLimiter(api.config.RateLimitSso/(60*5), &limiter.ExpirableOptions{
-					DefaultExpirationTTL: time.Hour,
-				}).SetBurst(30),
-			)).With(api.verifyCaptcha).Post("/", api.SingleSignOn)
+			r.With(api.limitHandler(api.limiterOpts.SSO)).
+				With(api.verifyCaptcha).Post("/", api.SingleSignOn)
 
 			r.Route("/saml", func(r *router) {
 				r.Get("/metadata", api.SAMLMetadata)
 
-				r.With(api.limitHandler(
-					// Allow requests at the specified rate per 5 minutes.
-					tollbooth.NewLimiter(api.config.SAML.RateLimitAssertion/(60*5), &limiter.ExpirableOptions{
-						DefaultExpirationTTL: time.Hour,
-					}).SetBurst(30),
-				)).Post("/acs", api.SamlAcs)
+				r.With(api.limitHandler(api.limiterOpts.SAMLAssertion)).
+					Post("/acs", api.SamlAcs)
 			})
 		})
 
@@ -366,4 +342,10 @@ func (a *API) HealthCheck(w http.ResponseWriter, r *http.Request) error {
 func (a *API) Mailer() mailer.Mailer {
 	config := a.config
 	return mailer.NewMailer(config)
+}
+
+// ServeHTTP implements the http.Handler interface by passing the request along
+// to its underlying Handler.
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.handler.ServeHTTP(w, r)
 }

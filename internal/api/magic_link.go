@@ -3,13 +3,13 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
-	"github.com/sethvargo/go-password/password"
+	"github.com/supabase/auth/internal/api/apierrors"
+	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
 )
@@ -22,12 +22,12 @@ type MagicLinkParams struct {
 	CodeChallenge       string                 `json:"code_challenge"`
 }
 
-func (p *MagicLinkParams) Validate() error {
+func (p *MagicLinkParams) Validate(a *API) error {
 	if p.Email == "" {
-		return unprocessableEntityError(ErrorCodeValidationFailed, "Password recovery requires an email")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeValidationFailed, "Password recovery requires an email")
 	}
 	var err error
-	p.Email, err = validateEmail(p.Email)
+	p.Email, err = a.validateEmail(p.Email)
 	if err != nil {
 		return err
 	}
@@ -46,7 +46,11 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	fmt.Println("MagicLink")
 
 	if !config.External.Email.Enabled {
-		return unprocessableEntityError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeEmailProviderDisabled, "Email logins are disabled")
+	}
+
+	if !config.External.Email.MagicLinkEnabled {
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeEmailProviderDisabled, "Login with magic link is disabled")
 	}
 
 	params := &MagicLinkParams{}
@@ -54,7 +58,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	err := jsonDecoder.Decode(params)
 	if err != nil {
 		fmt.Println("MagicLink error (could not read verification params)", err)
-		return badRequestError(ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
+		return badRequestError(apierrors.ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
 	}
 
 	if err := params.Validate(); err != nil {
@@ -77,7 +81,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 			isNewUser = true
 		} else {
 			fmt.Println("MagicLink error (database error finding user)", err)
-			return internalServerError("Database error finding user").WithInternalError(err)
+			return apierrors.NewInternalServerError("Database error finding user").WithInternalError(err)
 		}
 	}
 	if user != nil {
@@ -87,11 +91,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	if isNewUser {
 		// User either doesn't exist or hasn't completed the signup process.
 		// Sign them up with temporary password.
-		password, err := password.Generate(64, 10, 1, false, true)
-		if err != nil {
-			fmt.Println("MagicLink error (error creating user)", err)
-			return internalServerError("error creating user").WithInternalError(err)
-		}
+		password := crypto.GeneratePassword(config.Password.RequiredCharacters, 33)
 
 		signUpParams := &SignupParams{
 			Email:               params.Email,
@@ -154,12 +154,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 		return a.sendMagicLink(r, tx, user, flowType)
 	})
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			fmt.Println("MagicLink error (max frequency limit)", err)
-			return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, generateFrequencyLimitErrorMessage(user.RecoverySentAt, config.SMTP.MaxFrequency))
-		}
-		fmt.Println("MagicLink error (error sending magic link)", err)
-		return internalServerError("Error sending magic link").WithInternalError(err)
+		return err
 	}
 
 	return sendJSON(w, http.StatusOK, make(map[string]string))

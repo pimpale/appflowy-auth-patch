@@ -6,6 +6,12 @@ on:
       - master
       - release/*
 
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  id-token: write
+
 jobs:
   release_please:
     runs-on: ubuntu-latest
@@ -18,7 +24,7 @@ jobs:
       RELEASE_CANDIDATE: ${{ steps.versions.outputs.RELEASE_CANDIDATE }}
       RELEASE_NAME: ${{ steps.versions.outputs.RELEASE_NAME }}
     steps:
-      - uses: google-github-actions/release-please-action@v4
+      - uses: googleapis/release-please-action@v4
         id: release
         with:
           release-type: go
@@ -73,10 +79,10 @@ jobs:
           echo "RELEASE_CANDIDATE=${RELEASE_CANDIDATE}" >> "${GITHUB_OUTPUT}"
           echo "RELEASE_NAME=${RELEASE_NAME}" >> "${GITHUB_OUTPUT}"
 
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         if: ${{ steps.release.outputs.release_created == 'true' || steps.release.outputs.prs_created == 'true' }}
         with:
-          go-version: "^1.21.0" # The Go version to download (if necessary) and use.
+          go-version: "1.23.7" # The Go version to download (if necessary) and use.
 
       - name: Build release artifacts
         if: ${{ steps.release.outputs.release_created == 'true' || steps.release.outputs.prs_created == 'true' }}

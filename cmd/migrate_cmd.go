@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"embed"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
+
+var EmbeddedMigrations embed.FS
 
 var migrateCmd = cobra.Command{
 	Use:  "migrate",
@@ -76,11 +79,14 @@ func migrate(cmd *cobra.Command, args []string) {
 		log.Fatalf("%+v", errors.Wrap(err, "checking database connection"))
 	}
 
-	log.Debugf("Reading migrations from %s", globalConfig.DB.MigrationsPath)
-	mig, err := pop.NewFileMigrator(globalConfig.DB.MigrationsPath, db)
+	log.Debugf("Reading migrations from executable")
+	box, err := pop.NewMigrationBox(EmbeddedMigrations, db)
 	if err != nil {
 		log.Fatalf("%+v", errors.Wrap(err, "creating db migrator"))
 	}
+
+	mig := box.Migrator
+
 	log.Debugf("before status")
 
 	if log.Level == logrus.DebugLevel {
@@ -93,11 +99,11 @@ func migrate(cmd *cobra.Command, args []string) {
 	// turn off schema dump
 	mig.SchemaPath = ""
 
-	err = mig.Up()
+	count, err := mig.UpTo(0)
 	if err != nil {
 		log.Fatalf("%v", errors.Wrap(err, "running db migrations"))
 	} else {
-		log.Infof("GoTrue migrations applied successfully")
+		log.WithField("count", count).Infof("GoTrue migrations applied successfully")
 	}
 
 	log.Debugf("after status")

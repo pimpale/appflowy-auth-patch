@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 	"time"
 
@@ -15,9 +14,12 @@ import (
 	"github.com/didip/tollbooth/v5/limiter"
 	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/storage"
 )
 
 const (
@@ -185,76 +187,130 @@ func (ts *MiddlewareTestSuite) TestVerifyCaptchaInvalid() {
 	}
 }
 
-func (ts *MiddlewareTestSuite) TestLimitEmailOrPhoneSentHandler() {
-	// Set up rate limit config for this test
-	ts.Config.RateLimitEmailSent = 5
-	ts.Config.RateLimitSmsSent = 5
-	ts.Config.External.Phone.Enabled = true
-
-	cases := []struct {
-		desc             string
-		expectedErrorMsg string
-		requestBody      map[string]interface{}
-	}{
-		{
-			desc:             "Email rate limit exceeded",
-			expectedErrorMsg: "429: Email rate limit exceeded",
-			requestBody: map[string]interface{}{
-				"email": "test@example.com",
-			},
-		},
-		{
-			desc:             "SMS rate limit exceeded",
-			expectedErrorMsg: "429: SMS rate limit exceeded",
-			requestBody: map[string]interface{}{
-				"phone": "+1233456789",
-			},
-		},
-	}
-
-	limiter := ts.API.limitEmailOrPhoneSentHandler()
-	for _, c := range cases {
-		ts.Run(c.desc, func() {
-			var buffer bytes.Buffer
-			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.requestBody))
-			req := httptest.NewRequest(http.MethodPost, "http://localhost", &buffer)
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-
-			for i := 0; i < 5; i++ {
-				_, err := limiter(w, req)
-				require.NoError(ts.T(), err)
-			}
-
-			// should exceed rate limit on 5th try
-			_, err := limiter(w, req)
-			require.Error(ts.T(), err)
-			require.Equal(ts.T(), c.expectedErrorMsg, err.Error())
-		})
-	}
-}
-
 func (ts *MiddlewareTestSuite) TestIsValidExternalHost() {
 	cases := []struct {
-		desc        string
-		requestURL  string
+		desc          string
+		externalHosts []string
+
+		requestURL string
+		headers    http.Header
+
 		expectedURL string
 	}{
 		{
-			desc:        "Valid custom external url",
-			requestURL:  "https://example.custom.com",
-			expectedURL: "https://example.custom.com",
+			desc:        "no defined external hosts, no headers, no absolute request URL",
+			requestURL:  "/some-path",
+			expectedURL: ts.API.config.API.ExternalURL,
+		},
+
+		{
+			desc: "no defined external hosts, unauthorized X-Forwarded-Host without any external hosts",
+			headers: http.Header{
+				"X-Forwarded-Host": []string{
+					"external-host.com",
+				},
+			},
+			requestURL:  "/some-path",
+			expectedURL: ts.API.config.API.ExternalURL,
+		},
+
+		{
+			desc:          "defined external hosts, unauthorized X-Forwarded-Host",
+			externalHosts: []string{"authorized-host.com"},
+			headers: http.Header{
+				"X-Forwarded-Proto": []string{"https"},
+				"X-Forwarded-Host": []string{
+					"external-host.com",
+				},
+			},
+			requestURL:  "/some-path",
+			expectedURL: ts.API.config.API.ExternalURL,
+		},
+
+		{
+			desc:        "no defined external hosts, unauthorized Host",
+			requestURL:  "https://external-host.com/some-path",
+			expectedURL: ts.API.config.API.ExternalURL,
+		},
+
+		{
+			desc:          "defined external hosts, unauthorized Host",
+			externalHosts: []string{"authorized-host.com"},
+			requestURL:    "https://external-host.com/some-path",
+			expectedURL:   ts.API.config.API.ExternalURL,
+		},
+
+		{
+			desc:          "defined external hosts, authorized X-Forwarded-Host",
+			externalHosts: []string{"authorized-host.com"},
+			headers: http.Header{
+				"X-Forwarded-Proto": []string{"http"}, // this should be ignored and default to HTTPS
+				"X-Forwarded-Host": []string{
+					"authorized-host.com",
+				},
+			},
+			requestURL:  "https://X-Forwarded-Host-takes-precedence.com/some-path",
+			expectedURL: "https://authorized-host.com",
+		},
+
+		{
+			desc:          "defined external hosts, authorized Host",
+			externalHosts: []string{"authorized-host.com"},
+			requestURL:    "https://authorized-host.com/some-path",
+			expectedURL:   "https://authorized-host.com",
+		},
+
+		{
+			desc:          "defined external hosts, authorized X-Forwarded-Host",
+			externalHosts: []string{"authorized-host.com"},
+			headers: http.Header{
+				"X-Forwarded-Proto": []string{"http"}, // this should be ignored and default to HTTPS
+				"X-Forwarded-Host": []string{
+					"authorized-host.com",
+				},
+			},
+			requestURL:  "https://X-Forwarded-Host-takes-precedence.com/some-path",
+			expectedURL: "https://authorized-host.com",
+		},
+
+		{
+			desc:          "defined external hosts, authorized localhost in X-Forwarded-Host with HTTP",
+			externalHosts: []string{"localhost"},
+			headers: http.Header{
+				"X-Forwarded-Proto": []string{"http"},
+				"X-Forwarded-Host": []string{
+					"localhost",
+				},
+			},
+			requestURL:  "/some-path",
+			expectedURL: "http://localhost",
+		},
+
+		{
+			desc:          "defined external hosts, authorized localhost in Host with HTTP",
+			externalHosts: []string{"localhost"},
+			requestURL:    "http://localhost:3000/some-path",
+			expectedURL:   "http://localhost",
 		},
 	}
 
-	_, err := url.ParseRequestURI("https://example.custom.com")
-	require.NoError(ts.T(), err)
+	require.NotEmpty(ts.T(), ts.API.config.API.ExternalURL)
 
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			req := httptest.NewRequest(http.MethodPost, c.requestURL, nil)
+			if c.headers != nil {
+				req.Header = c.headers
+			}
+
+			originalHosts := ts.API.config.Mailer.ExternalHosts
+			ts.API.config.Mailer.ExternalHosts = c.externalHosts
+
 			w := httptest.NewRecorder()
 			ctx, err := ts.API.isValidExternalHost(w, req)
+
+			ts.API.config.Mailer.ExternalHosts = originalHosts
+
 			require.NoError(ts.T(), err)
 
 			externalURL := getExternalHost(ctx)
@@ -272,7 +328,7 @@ func (ts *MiddlewareTestSuite) TestRequireSAMLEnabled() {
 		{
 			desc:        "SAML not enabled",
 			isEnabled:   false,
-			expectedErr: notFoundError(ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled"),
+			expectedErr: apierrors.NewNotFoundError(apierrors.ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled"),
 		},
 		{
 			desc:        "SAML enabled",
@@ -333,7 +389,7 @@ func (ts *MiddlewareTestSuite) TestTimeoutMiddleware() {
 
 	var data map[string]interface{}
 	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
-	require.Equal(ts.T(), ErrorCodeRequestTimeout, data["error_code"])
+	require.Equal(ts.T(), apierrors.ErrorCodeRequestTimeout, data["error_code"])
 	require.Equal(ts.T(), float64(504), data["code"])
 	require.NotNil(ts.T(), data["msg"])
 }
@@ -391,102 +447,65 @@ func (ts *MiddlewareTestSuite) TestLimitHandler() {
 	require.Equal(ts.T(), http.StatusTooManyRequests, w.Code)
 }
 
-func (ts *MiddlewareTestSuite) TestLimitHandlerWithSharedLimiter() {
-	// setup config for shared limiter and ip-based limiter to work
-	ts.Config.RateLimitHeader = "X-Rate-Limit"
-	ts.Config.External.Email.Enabled = true
-	ts.Config.External.Phone.Enabled = true
-	ts.Config.Mailer.Autoconfirm = false
-	ts.Config.Sms.Autoconfirm = false
+type MockCleanup struct {
+	mock.Mock
+}
 
-	ipBasedLimiter := func(max float64) *limiter.Limiter {
-		return tollbooth.NewLimiter(max, &limiter.ExpirableOptions{
-			DefaultExpirationTTL: time.Hour,
+func (m *MockCleanup) Clean(db *storage.Connection) (int, error) {
+	m.Called(db)
+	return 0, nil
+}
+
+func (ts *MiddlewareTestSuite) TestDatabaseCleanup() {
+	testHandler := func(statusCode int) http.HandlerFunc {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(statusCode)
+			b, _ := json.Marshal(map[string]interface{}{"message": "ok"})
+			w.Write([]byte(b))
 		})
 	}
-
-	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 
 	cases := []struct {
-		desc                 string
-		sharedLimiterConfig  *conf.GlobalConfiguration
-		ipBasedLimiterConfig float64
-		body                 map[string]interface{}
-		expectedErrorCode    string
+		desc       string
+		statusCode int
+		method     string
 	}{
 		{
-			desc: "Exceed ip-based rate limit before shared limiter",
-			sharedLimiterConfig: &conf.GlobalConfiguration{
-				RateLimitEmailSent: 10,
-				RateLimitSmsSent:   10,
-			},
-			ipBasedLimiterConfig: 1,
-			body: map[string]interface{}{
-				"email": "foo@example.com",
-			},
-			expectedErrorCode: ErrorCodeOverRequestRateLimit,
+			desc:       "Run cleanup successfully",
+			statusCode: http.StatusOK,
+			method:     http.MethodPost,
 		},
 		{
-			desc: "Exceed email shared limiter",
-			sharedLimiterConfig: &conf.GlobalConfiguration{
-				RateLimitEmailSent: 1,
-				RateLimitSmsSent:   1,
-			},
-			ipBasedLimiterConfig: 10,
-			body: map[string]interface{}{
-				"email": "foo@example.com",
-			},
-			expectedErrorCode: ErrorCodeOverEmailSendRateLimit,
+			desc:       "Skip cleanup if GET",
+			statusCode: http.StatusOK,
+			method:     http.MethodGet,
 		},
 		{
-			desc: "Exceed sms shared limiter",
-			sharedLimiterConfig: &conf.GlobalConfiguration{
-				RateLimitEmailSent: 1,
-				RateLimitSmsSent:   1,
-			},
-			ipBasedLimiterConfig: 10,
-			body: map[string]interface{}{
-				"phone": "123456789",
-			},
-			expectedErrorCode: ErrorCodeOverSMSSendRateLimit,
+			desc:       "Skip cleanup if 3xx",
+			statusCode: http.StatusSeeOther,
+			method:     http.MethodPost,
+		},
+		{
+			desc:       "Skip cleanup if 4xx",
+			statusCode: http.StatusBadRequest,
+			method:     http.MethodPost,
+		},
+		{
+			desc:       "Skip cleanup if 5xx",
+			statusCode: http.StatusInternalServerError,
+			method:     http.MethodPost,
 		},
 	}
 
+	mockCleanup := new(MockCleanup)
+	mockCleanup.On("Clean", mock.Anything).Return(0, nil)
 	for _, c := range cases {
-		ts.Run(c.desc, func() {
-			ts.Config.RateLimitEmailSent = c.sharedLimiterConfig.RateLimitEmailSent
-			ts.Config.RateLimitSmsSent = c.sharedLimiterConfig.RateLimitSmsSent
-			lmt := ts.API.limitHandler(ipBasedLimiter(c.ipBasedLimiterConfig))
-			sharedLimiter := ts.API.limitEmailOrPhoneSentHandler()
-
-			// get the minimum amount to reach the threshold just before the rate limit is exceeded
-			threshold := min(c.sharedLimiterConfig.RateLimitEmailSent, c.sharedLimiterConfig.RateLimitSmsSent, c.ipBasedLimiterConfig)
-			for i := 0; i < int(threshold); i++ {
-				var buffer bytes.Buffer
-				require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.body))
-				req := httptest.NewRequest(http.MethodPost, "http://localhost", &buffer)
-				req.Header.Add(ts.Config.RateLimitHeader, "0.0.0.0")
-
-				w := httptest.NewRecorder()
-				lmt.handler(sharedLimiter.handler(okHandler)).ServeHTTP(w, req)
-				require.Equal(ts.T(), http.StatusOK, w.Code)
-			}
-
-			var buffer bytes.Buffer
-			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.body))
-			req := httptest.NewRequest(http.MethodPost, "http://localhost", &buffer)
-			req.Header.Add(ts.Config.RateLimitHeader, "0.0.0.0")
-
-			// check if the rate limit is exceeded with the expected error code
+		ts.Run("DatabaseCleanup", func() {
+			req := httptest.NewRequest(c.method, "http://localhost", nil)
 			w := httptest.NewRecorder()
-			lmt.handler(sharedLimiter.handler(okHandler)).ServeHTTP(w, req)
-			require.Equal(ts.T(), http.StatusTooManyRequests, w.Code)
-
-			var data map[string]interface{}
-			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
-			require.Equal(ts.T(), c.expectedErrorCode, data["error_code"])
+			ts.API.databaseCleanup(mockCleanup)(testHandler(c.statusCode)).ServeHTTP(w, req)
+			require.Equal(ts.T(), c.statusCode, w.Code)
 		})
 	}
+	mockCleanup.AssertNumberOfCalls(ts.T(), "Clean", 1)
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/fatih/structs"
 	"github.com/sethvargo/go-password/password"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/crypto"
@@ -45,21 +46,21 @@ type VerifyParams struct {
 	RedirectTo string `json:"redirect_to"`
 }
 
-func (p *VerifyParams) Validate(r *http.Request) error {
+func (p *VerifyParams) Validate(r *http.Request, a *API) error {
 	var err error
 	if p.Type == "" {
-		return badRequestError(ErrorCodeValidationFailed, "Verify requires a verification type")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires a verification type")
 	}
 	switch r.Method {
 	case http.MethodGet:
 		if p.Token == "" {
-			return badRequestError(ErrorCodeValidationFailed, "Verify requires a token or a token hash")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires a token or a token hash")
 		}
 		// TODO: deprecate the token query param from GET /verify and use token_hash instead (breaking change)
 		p.TokenHash = p.Token
 	case http.MethodPost:
 		if (p.Token == "" && p.TokenHash == "") || (p.Token != "" && p.TokenHash != "") {
-			return badRequestError(ErrorCodeValidationFailed, "Verify requires either a token or a token hash")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires either a token or a token hash")
 		}
 		if p.Token != "" {
 			if isPhoneOtpVerification(p) {
@@ -69,17 +70,17 @@ func (p *VerifyParams) Validate(r *http.Request) error {
 				}
 				p.TokenHash = crypto.GenerateTokenHash(p.Phone, p.Token)
 			} else if isEmailOtpVerification(p) {
-				p.Email, err = validateEmail(p.Email)
+				p.Email, err = a.validateEmail(p.Email)
 				if err != nil {
-					return unprocessableEntityError(ErrorCodeValidationFailed, "Invalid email format").WithInternalError(err)
+					return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeValidationFailed, "Invalid email format").WithInternalError(err)
 				}
 				p.TokenHash = crypto.GenerateTokenHash(p.Email, p.Token)
 			} else {
-				return badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify")
+				return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify")
 			}
 		} else if p.TokenHash != "" {
 			if p.Email != "" || p.Phone != "" || p.RedirectTo != "" {
-				return badRequestError(ErrorCodeValidationFailed, "Only the token_hash and type should be provided")
+				return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Only the token_hash and type should be provided")
 			}
 		}
 	default:
@@ -96,7 +97,7 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 		params.Token = r.FormValue("token")
 		params.Type = r.FormValue("type")
 		params.RedirectTo = utilities.GetReferrer(r, a.config)
-		if err := params.Validate(r); err != nil {
+		if err := params.Validate(r, a); err != nil {
 			return err
 		}
 		return a.verifyGet(w, r, params)
@@ -104,7 +105,7 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 		if err := retrieveRequestParams(r, params); err != nil {
 			return err
 		}
-		if err := params.Validate(r); err != nil {
+		if err := params.Validate(r, a); err != nil {
 			return err
 		}
 		return a.verifyPost(w, r, params)
@@ -117,7 +118,6 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyParams) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 
 	var (
 		user        *models.User
@@ -162,7 +162,7 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 				return nil
 			}
 		default:
-			return badRequestError(ErrorCodeValidationFailed, "Unsupported verification type")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Unsupported verification type")
 		}
 
 		if terr != nil {
@@ -185,12 +185,9 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 				return terr
 			}
 
-			if terr = a.setCookieTokens(config, token, false, w); terr != nil {
-				return internalServerError("Failed to set JWT cookie. %s", terr)
-			}
 		} else if isPKCEFlow(flowType) {
 			if authCode, terr = issueAuthCode(tx, user, authenticationMethod); terr != nil {
-				return badRequestError(ErrorCodeFlowStateNotFound, "No associated flow state found. %s", terr)
+				return apierrors.NewBadRequestError(apierrors.ErrorCodeFlowStateNotFound, "No associated flow state found. %s", terr)
 			}
 		}
 		return nil
@@ -227,7 +224,6 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyParams) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 
 	var (
 		user        *models.User
@@ -265,7 +261,7 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		case smsVerification, phoneChangeVerification:
 			user, terr = a.smsVerify(r, tx, user, params)
 		default:
-			return badRequestError(ErrorCodeValidationFailed, "Unsupported verification type")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Unsupported verification type")
 		}
 
 		if terr != nil {
@@ -284,10 +280,6 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		token, terr = a.issueRefreshToken(r, tx, user, models.OTP, grantParams)
 		if terr != nil {
 			return terr
-		}
-
-		if terr = a.setCookieTokens(config, token, false, w); terr != nil {
-			return internalServerError("Failed to set JWT cookie. %s", terr)
 		}
 		return nil
 	})
@@ -326,7 +318,7 @@ func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.C
 		var terr error
 		if shouldUpdatePassword {
 			if terr = user.UpdatePassword(tx, nil); terr != nil {
-				return internalServerError("Error storing password").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error storing password").WithInternalError(terr)
 			}
 		}
 
@@ -335,8 +327,21 @@ func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.C
 		}
 
 		if terr = user.Confirm(tx); terr != nil {
-			return internalServerError("Error confirming user").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error confirming user").WithInternalError(terr)
 		}
+
+		for _, identity := range user.Identities {
+			if identity.Email == "" || user.Email == "" || identity.Email != user.Email {
+				continue
+			}
+
+			if terr = identity.UpdateIdentityData(tx, map[string]interface{}{
+				"email_verified": true,
+			}); terr != nil {
+				return apierrors.NewInternalServerError("Error setting email_verified to true on identity").WithInternalError(terr)
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -368,7 +373,7 @@ func (a *API) recoverVerify(r *http.Request, conn *storage.Connection, user *mod
 	})
 
 	if err != nil {
-		return nil, internalServerError("Database error updating user").WithInternalError(err)
+		return nil, apierrors.NewInternalServerError("Database error updating user").WithInternalError(err)
 	}
 	return user, nil
 }
@@ -382,7 +387,7 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 				return terr
 			}
 			if terr := user.ConfirmPhone(tx); terr != nil {
-				return internalServerError("Error confirming user").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error confirming user").WithInternalError(terr)
 			}
 		} else if params.Type == phoneChangeVerification {
 			if terr := models.NewAuditLogEntry(r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
@@ -409,7 +414,7 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 				}
 			}
 			if terr := user.ConfirmPhoneChange(tx); terr != nil {
-				return internalServerError("Error confirming user").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error confirming user").WithInternalError(terr)
 			}
 		}
 
@@ -421,7 +426,7 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 		}
 
 		if terr := tx.Load(user, "Identities"); terr != nil {
-			return internalServerError("Error refetching identities").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error refetching identities").WithInternalError(terr)
 		}
 		return nil
 	})
@@ -448,10 +453,10 @@ func (a *API) prepErrorRedirectURL(err *HTTPError, r *http.Request, rurl string,
 		hq.Set("error", str)
 		q.Set("error", str)
 	}
-	hq.Set("error_code", strconv.Itoa(err.HTTPStatus))
+	hq.Set("error_code", err.ErrorCode)
 	hq.Set("error_description", err.Message)
 
-	q.Set("error_code", strconv.Itoa(err.HTTPStatus))
+	q.Set("error_code", err.ErrorCode)
 	q.Set("error_description", err.Message)
 	if flowType == models.PKCEFlow {
 		// Additionally, may override existing error query param if set to PKCE.
@@ -563,10 +568,10 @@ func (a *API) emailChangeVerify(r *http.Request, conn *storage.Connection, param
 			}
 		}
 		if terr := tx.Load(user, "Identities"); terr != nil {
-			return internalServerError("Error refetching identities").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error refetching identities").WithInternalError(terr)
 		}
 		if terr := user.ConfirmEmailChange(tx, zeroConfirmation); terr != nil {
-			return internalServerError("Error confirm email").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error confirm email").WithInternalError(terr)
 		}
 
 		return nil
@@ -594,18 +599,18 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 	case mail.EmailChangeVerification:
 		user, err = models.FindUserByEmailChangeToken(conn, params.TokenHash)
 	default:
-		return nil, badRequestError(ErrorCodeValidationFailed, "Invalid email verification type")
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Invalid email verification type")
 	}
 
 	if err != nil {
 		if models.IsNotFoundError(err) {
-			return nil, forbiddenError(ErrorCodeOTPExpired, "Email link is invalid or has expired").WithInternalError(err)
+			return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeOTPExpired, "Email link is invalid or has expired").WithInternalError(err)
 		}
-		return nil, internalServerError("Database error finding user from email link").WithInternalError(err)
+		return nil, apierrors.NewInternalServerError("Database error finding user from email link").WithInternalError(err)
 	}
 
 	if user.IsBanned() {
-		return nil, forbiddenError(ErrorCodeUserBanned, "User is banned")
+		return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeUserBanned, "User is banned")
 	}
 
 	var isExpired bool
@@ -627,7 +632,7 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 	}
 
 	if isExpired {
-		return nil, forbiddenError(ErrorCodeOTPExpired, "Email link is invalid or has expired").WithInternalMessage("email link has expired")
+		return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeOTPExpired, "Email link is invalid or has expired").WithInternalMessage("email link has expired")
 	}
 
 	return user, nil
@@ -656,13 +661,13 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 
 	if err != nil {
 		if models.IsNotFoundError(err) {
-			return nil, forbiddenError(ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
+			return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
 		}
-		return nil, internalServerError("Database error finding user").WithInternalError(err)
+		return nil, apierrors.NewInternalServerError("Database error finding user").WithInternalError(err)
 	}
 
 	if user.IsBanned() {
-		return nil, forbiddenError(ErrorCodeUserBanned, "User is banned")
+		return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeUserBanned, "User is banned")
 	}
 
 	var isValid bool
@@ -705,7 +710,7 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 
 		if !config.Hook.SendSMS.Enabled && config.Sms.IsTwilioVerifyProvider() {
 			if err := smsProvider.(*sms_provider.TwilioVerifyProvider).VerifyOTP(phone, params.Token); err != nil {
-				return nil, forbiddenError(ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
+				return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
 			}
 			return user, nil
 		}
@@ -713,7 +718,7 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 	}
 
 	if !isValid {
-		return nil, forbiddenError(ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalMessage("token has expired or is invalid")
+		return nil, apierrors.NewForbiddenError(apierrors.ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalMessage("token has expired or is invalid")
 	}
 	return user, nil
 }
@@ -727,7 +732,7 @@ func isOtpValid(actual, expected string, sentAt *time.Time, otpExp uint) bool {
 }
 
 func isOtpExpired(sentAt *time.Time, otpExp uint) bool {
-	return time.Now().After(sentAt.Add(time.Second * time.Duration(otpExp)))
+	return time.Now().After(sentAt.Add(time.Second * time.Duration(otpExp))) // #nosec G115
 }
 
 // isPhoneOtpVerification checks if the verification came from a phone otp

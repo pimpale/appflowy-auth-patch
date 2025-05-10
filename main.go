@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -9,15 +10,19 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/cmd"
-	"github.com/supabase/auth/internal/api"
 	"github.com/supabase/auth/internal/observability"
 )
+
+//go:embed migrations/*
+var embeddedMigrations embed.FS
 
 func init() {
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 }
 
 func main() {
+	cmd.EmbeddedMigrations = embeddedMigrations
+
 	execCtx, execCancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT)
 	defer execCancel()
 
@@ -36,14 +41,6 @@ func main() {
 	defer shutdownCancel()
 
 	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		// wait for API servers to shut down gracefully
-		api.WaitForCleanup(shutdownCtx)
-	}()
 
 	wg.Add(1)
 	go func() {

@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/models"
 )
@@ -816,7 +817,7 @@ func (ts *AdminTestSuite) TestAdminUserUpdateFactor() {
 	require.NoError(ts.T(), err, "Error making new user")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error creating user")
 
-	f := models.NewTOTPFactor(u, "testSimpleName")
+	f := models.NewPhoneFactor(u, "123456789", "testSimpleName")
 	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 
@@ -833,19 +834,11 @@ func (ts *AdminTestSuite) TestAdminUserUpdateFactor() {
 			ExpectedCode: http.StatusOK,
 		},
 		{
-			Desc: "Update factor: valid factor type",
+			Desc: "Update Factor phone number",
 			FactorData: map[string]interface{}{
-				"friendly_name": "john",
-				"factor_type":   models.TOTP,
+				"phone": "+1976154321",
 			},
 			ExpectedCode: http.StatusOK,
-		},
-		{
-			Desc: "Update factor: invalid factor",
-			FactorData: map[string]interface{}{
-				"factor_type": "invalid_factor",
-			},
-			ExpectedCode: http.StatusBadRequest,
 		},
 	}
 
@@ -916,7 +909,7 @@ func (ts *AdminTestSuite) TestAdminUserCreateValidationErrors() {
 
 			data := map[string]interface{}{}
 			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
-			require.Equal(ts.T(), data["error_code"], ErrorCodeValidationFailed)
+			require.Equal(ts.T(), data["error_code"], apierrors.ErrorCodeValidationFailed)
 		})
 
 	}

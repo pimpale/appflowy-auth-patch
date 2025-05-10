@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/supabase/auth/internal/api/apierrors"
 	mail "github.com/supabase/auth/internal/mailer"
 
 	"github.com/stretchr/testify/assert"
@@ -47,6 +49,15 @@ func (ts *VerifyTestSuite) SetupTest() {
 	u, err := models.NewUser("12345678", "test@example.com", "password", ts.Config.JWT.Aud, nil)
 	require.NoError(ts.T(), err, "Error creating test user model")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
+
+	// Create identity
+	i, err := models.NewIdentity(u, "email", map[string]interface{}{
+		"sub":            u.ID.String(),
+		"email":          "test@example.com",
+		"email_verified": false,
+	})
+	require.NoError(ts.T(), err, "Error creating test identity model")
+	require.NoError(ts.T(), ts.API.db.Create(i), "Error saving new test identity")
 }
 
 func (ts *VerifyTestSuite) TestVerifyPasswordRecovery() {
@@ -304,7 +315,7 @@ func (ts *VerifyTestSuite) TestExpiredConfirmationToken() {
 
 	f, err := url.ParseQuery(rurl.Fragment)
 	require.NoError(ts.T(), err)
-	assert.Equal(ts.T(), "403", f.Get("error_code"))
+	assert.Equal(ts.T(), apierrors.ErrorCodeOTPExpired, f.Get("error_code"))
 	assert.Equal(ts.T(), "Email link is invalid or has expired", f.Get("error_description"))
 	assert.Equal(ts.T(), "access_denied", f.Get("error"))
 }
@@ -672,6 +683,8 @@ func (ts *VerifyTestSuite) TestVerifySignupWithRedirectURLContainedPath() {
 			u, err = models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 			require.NoError(ts.T(), err)
 			assert.True(ts.T(), u.IsConfirmed())
+			assert.True(ts.T(), u.UserMetaData["email_verified"].(bool))
+			assert.True(ts.T(), u.Identities[0].IdentityData["email_verified"].(bool))
 		})
 	}
 }
@@ -823,7 +836,7 @@ func (ts *VerifyTestSuite) TestVerifyBannedUser() {
 
 			f, err := url.ParseQuery(rurl.Fragment)
 			require.NoError(ts.T(), err)
-			assert.Equal(ts.T(), "403", f.Get("error_code"))
+			assert.Equal(ts.T(), apierrors.ErrorCodeUserBanned, f.Get("error_code"))
 		})
 	}
 }
@@ -875,6 +888,18 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 			},
 		},
 		{
+			desc:     "Valid Signup Token Hash",
+			sentTime: time.Now(),
+			body: map[string]interface{}{
+				"type":       mail.SignupVerification,
+				"token_hash": crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+			expected: expected{
+				code:      http.StatusOK,
+				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+		},
+		{
 			desc:     "Valid Recovery OTP",
 			sentTime: time.Now(),
 			body: map[string]interface{}{
@@ -894,6 +919,19 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 				"type":  mail.EmailOTPVerification,
 				"token": "123456",
 				"email": u.GetEmail(),
+			},
+			expected: expected{
+				code:      http.StatusOK,
+				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+		},
+		{
+			desc:     "Valid Email OTP (email casing shouldn't matter)",
+			sentTime: time.Now(),
+			body: map[string]interface{}{
+				"type":  mail.EmailOTPVerification,
+				"token": "123456",
+				"email": strings.ToUpper(u.GetEmail()),
 			},
 			expected: expected{
 				code:      http.StatusOK,
@@ -924,18 +962,6 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 			expected: expected{
 				code:      http.StatusOK,
 				tokenHash: crypto.GenerateTokenHash(u.PhoneChange, "123456"),
-			},
-		},
-		{
-			desc:     "Valid Signup Token Hash",
-			sentTime: time.Now(),
-			body: map[string]interface{}{
-				"type":       mail.SignupVerification,
-				"token_hash": crypto.GenerateTokenHash(u.GetEmail(), "123456"),
-			},
-			expected: expected{
-				code:      http.StatusOK,
-				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
 			},
 		},
 		{
@@ -1131,7 +1157,7 @@ func (ts *VerifyTestSuite) TestPrepRedirectURL() {
 
 func (ts *VerifyTestSuite) TestPrepErrorRedirectURL() {
 	const DefaultError = "Invalid redirect URL"
-	redirectError := fmt.Sprintf("error=invalid_request&error_code=400&error_description=%s", url.QueryEscape(DefaultError))
+	redirectError := fmt.Sprintf("error=invalid_request&error_code=validation_failed&error_description=%s", url.QueryEscape(DefaultError))
 
 	cases := []struct {
 		desc     string
@@ -1172,7 +1198,7 @@ func (ts *VerifyTestSuite) TestPrepErrorRedirectURL() {
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-			rurl, err := ts.API.prepErrorRedirectURL(badRequestError(ErrorCodeValidationFailed, DefaultError), req, c.rurl, c.flowType)
+			rurl, err := ts.API.prepErrorRedirectURL(apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, DefaultError), req, c.rurl, c.flowType)
 			require.NoError(ts.T(), err)
 			require.Equal(ts.T(), c.expected, rurl)
 		})
@@ -1222,7 +1248,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Token: "some-token",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify"),
 		},
 		{
 			desc: "Cannot send both TokenHash and Token",
@@ -1232,7 +1258,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				TokenHash: "some-token-hash",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires either a token or a token hash"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires either a token or a token hash"),
 		},
 		{
 			desc: "No verification type specified",
@@ -1241,14 +1267,14 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Email: "email@example.com",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires a verification type"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires a verification type"),
 		},
 	}
 
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			req := httptest.NewRequest(c.method, "http://localhost", nil)
-			err := c.params.Validate(req)
+			err := c.params.Validate(req, ts.API)
 			require.Equal(ts.T(), c.expected, err)
 		})
 	}
