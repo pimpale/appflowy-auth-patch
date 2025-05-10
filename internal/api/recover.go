@@ -73,7 +73,7 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 			sessionID = &session.ID
 		}
 		if terr := user.UpdatePassword(tx, sessionID); terr != nil {
-			return internalServerError("Error during resetting password").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error during resetting password").WithInternalError(terr)
 		}
 		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 			return terr

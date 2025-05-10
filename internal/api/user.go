@@ -87,13 +87,13 @@ func (a *API) UserAuthInfoGet(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	claims := getClaims(ctx)
 	if claims == nil {
-		return internalServerError("Could not read claims")
+		return apierrors.NewInternalServerError("Could not read claims")
 	}
 
 	aud := a.requestAud(ctx, r)
 	audienceFromClaims, _ := claims.GetAudience()
 	if len(audienceFromClaims) == 0 || aud != audienceFromClaims[0] {
-		return badRequestError(ErrorCodeValidationFailed, "Token audience doesn't match request audience")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Token audience doesn't match request audience")
 	}
 
 	user := getUser(ctx)
@@ -118,10 +118,10 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if user.IsAnonymous {
-		return unprocessableEntityError(ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
 	}
 	if user.IsSSOUser {
-		return unprocessableEntityError(ErrorCodeUnknown, "Updating password of an SSO user is not possible")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an SSO user is not possible")
 	}
 
 	password := params.Password
@@ -136,14 +136,14 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		if !isCurrentPasswordCorrect {
-			return unprocessableEntityError(ErrorCodeIncorrectCurrentPassword, "Incorrect current password")
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeIncorrectCurrentPassword, "Incorrect current password")
 		}
 		isSamePassword, _, err := user.Authenticate(ctx, db, password, config.Security.DBEncryption.DecryptionKeys, false, "")
 		if err != nil {
 			return err
 		}
 		if isSamePassword {
-			return unprocessableEntityError(ErrorCodeSamePassword, "New password should be different from the old password.")
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeSamePassword, "New password should be different from the old password.")
 		}
 	}
 
@@ -159,7 +159,7 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		if terr = user.UpdatePassword(tx, sessionID); terr != nil {
-			return internalServerError("Error during password storage").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error during password storage").WithInternalError(terr)
 		}
 
 		if terr := models.NewAuditLogEntry(r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {

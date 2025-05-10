@@ -439,7 +439,7 @@ func (a *API) sendReauthenticationOtp(r *http.Request, tx *storage.Connection, u
 }
 
 func (a *API) sendMagicLink(r *http.Request, tx *storage.Connection, u *models.User, flowType models.FlowType) error {
-	var err error
+	// var err error
 	config := a.config
 	otpLength := config.Mailer.OtpLength
 

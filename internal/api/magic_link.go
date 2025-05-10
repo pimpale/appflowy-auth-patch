@@ -58,10 +58,10 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	err := jsonDecoder.Decode(params)
 	if err != nil {
 		fmt.Println("MagicLink error (could not read verification params)", err)
-		return badRequestError(apierrors.ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
 	}
 
-	if err := params.Validate(); err != nil {
+	if err := params.Validate(a); err != nil {
 		fmt.Println("MagicLink error (could not validate params)", err)
 		return err
 	}

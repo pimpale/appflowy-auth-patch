@@ -208,26 +208,7 @@ func NewAPIWithVersion(globalConfig *conf.GlobalConfiguration, db *storage.Conne
 
 		r.With(api.requireAuthentication).Route("/user", func(r *router) {
 			r.Get("/", api.UserGet)
-<<<<<<< HEAD
-			r.Get("/auth-info", api.UserAuthInfoGet)
-			r.With(api.limitHandler(
-				// Allow requests at the specified rate per 5 minutes
-				tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-					DefaultExpirationTTL: time.Hour,
-				}).SetBurst(30),
-			)).With(sharedLimiter).Put("/", api.UserUpdate)
-=======
 			r.With(api.limitHandler(api.limiterOpts.User)).Put("/", api.UserUpdate)
->>>>>>> upstream/master
-
-			r.Route("/change-password", func(r *router) {
-				r.With(api.limitHandler(
-					// Allow requests at the specified rate per 5 minutes
-					tollbooth.NewLimiter(api.config.RateLimitOtp/(60*5), &limiter.ExpirableOptions{
-						DefaultExpirationTTL: time.Hour,
-					}).SetBurst(30),
-				)).With(sharedLimiter).Post("/", api.UserChangePassword)
-			})
 
 			r.Route("/identities", func(r *router) {
 				r.Use(api.requireManualLinkingEnabled)
